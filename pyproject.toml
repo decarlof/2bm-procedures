@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "2bm-procedures"
+version = "0.0.1"
+description = "Executable Python procedures (alignments, baselines, recoveries, calibrations) for the APS 2-BM imaging beamline."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Francesco De Carlo" },
+]
+keywords = ["aps", "2-bm", "tomography", "beamline", "alignment", "epics", "procedures"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "pyepics>=3.5",
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "pytest-mock>=3",
+]
+cora = [
+    "httpx>=0.25",  # for cora_log REST client; only needed if you want audit-spine logging
+]
+
+[project.urls]
+Homepage = "https://github.com/decarlof/2bm-procedures"
+"Issue tracker" = "https://github.com/decarlof/2bm-procedures/issues"
+"2-BM docs" = "https://docs2bm.readthedocs.io"
+"cora project" = "https://github.com/xmap/cora"
+
+[tool.setuptools.packages.find]
+include = ["procedures*"]
+exclude = ["tests*"]
