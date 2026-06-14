@@ -242,6 +242,38 @@ PRECONDITIONS = [
 ]
 
 
+# Aerotech PRO225SL-1000 datasheet straightness floor (~9.5 um over
+# the full 1 m travel). Treated here as a per-mm slope contribution
+# that no amount of linear table-tilt correction can remove; it sets
+# the lower bound for any convergence threshold regardless of optics.
+RAIL_STRAIGHTNESS_FLOOR_URAD = 10.0
+
+
+def expected_noise_floor_urad(pixel_um: float, bin_x: int, magnification: float,
+                              dz_mm: float,
+                              centroid_noise_pix: float = 1.0,
+                              straightness_floor_urad: float =
+                                  RAIL_STRAIGHTNESS_FLOOR_URAD) -> float:
+    """Estimate the practical floor on the convergence threshold.
+
+    Two contributors:
+
+    - **Measurement noise** -- ``centroid_noise_pix x object_pitch_um / dz``,
+      expressed in urad. Scales inversely with magnification: higher mag ->
+      finer measurable slope.
+    - **Rail straightness** -- the PRO225SL's intrinsic non-straightness.
+      Independent of optics; a hard floor that linear table tilt cannot
+      remove.
+
+    Returns the larger of the two -- the procedure cannot meaningfully
+    converge below this value at the given operating point.
+    """
+    object_pitch_um = pixel_um * bin_x / magnification
+    measurement_urad = (centroid_noise_pix * object_pitch_um
+                        / dz_mm * 1000.0)
+    return max(measurement_urad, straightness_floor_urad)
+
+
 log = logging.getLogger(__name__)
 
 
@@ -255,7 +287,11 @@ class Config:
     z_far: float = 500.0
     z_calibration_step_urad: float = 50.0
     exposure_time: float = 0.05
-    convergence_threshold_urad: float = 5.0
+    # None -> auto-compute at runtime from lens/binning/dz via
+    # expected_noise_floor_urad() x convergence_safety_margin.
+    convergence_threshold_urad: float | None = None
+    convergence_safety_margin: float = 1.5
+    centroid_noise_pix: float = 1.0
     max_iterations: int = 5
     threshold_fraction: float = 0.5
     camera_pixel_um: float = 3.45
@@ -502,6 +538,15 @@ class DetectorZRailAlignment:
         self._cam_prefix: str = ""
         self._magnification: float = 1.0
         self._pixel_um: float = config.camera_pixel_um   # auto-set by detect_*
+        # Effective convergence threshold -- resolved in run() after
+        # detect_camera_and_lens() runs (needs binning + lens to compute
+        # the noise floor).
+        self._convergence_threshold_urad: float = 0.0
+        # Set by iterate() when max_iterations is exhausted but the best
+        # |tilt| seen is strictly better than the starting state -- the
+        # finally-block then leaves the table at the best pose instead
+        # of restoring it to baseline.
+        self._best_state_committed: bool = False
 
         # Z-range guard (procedure-level safety band).
         if not (Z_GUARD_MIN_MM <= config.z_near < config.z_far <= Z_GUARD_MAX_MM):
@@ -566,6 +611,51 @@ class DetectorZRailAlignment:
                  cam_label, cam_idx, self._cam_prefix,
                  bin_x, bin_y, self._pixel_um,
                  lens_label, lens_idx, self._magnification)
+
+    # ---- resolve convergence threshold from physical floors ---------------
+
+    def _resolve_convergence_threshold(self) -> None:
+        """Compute the effective convergence threshold from the lens +
+        binning + dz, OR honour the operator's --convergence-urad override.
+
+        Two floors contribute:
+        - Measurement noise: centroid_noise_pix * obj_pitch / dz (lens-dep).
+        - Rail straightness: ~10 urad at any sub-300 mm range (independent).
+
+        Default threshold = floor x safety_margin (1.5x). Operator overrides
+        win, but a warning is logged if the override is below the floor
+        (procedure cannot converge).
+        """
+        c = self.config
+        dz = c.z_far - c.z_near
+        floor = expected_noise_floor_urad(
+            pixel_um=c.camera_pixel_um,
+            bin_x=int(round(self._pixel_um / c.camera_pixel_um)),
+            magnification=self._magnification,
+            dz_mm=dz,
+            centroid_noise_pix=c.centroid_noise_pix,
+        )
+        suggested = floor * c.convergence_safety_margin
+        if c.convergence_threshold_urad is None:
+            self._convergence_threshold_urad = suggested
+            log.info("convergence threshold auto-set to %.1f urad "
+                     "(noise floor %.1f urad x safety margin %.2f). "
+                     "Override with --convergence-urad.",
+                     suggested, floor, c.convergence_safety_margin)
+        else:
+            self._convergence_threshold_urad = c.convergence_threshold_urad
+            if c.convergence_threshold_urad < floor:
+                log.warning(
+                    "operator-supplied convergence threshold %.1f urad "
+                    "is BELOW the physical noise floor %.1f urad "
+                    "(measurement + rail straightness). The procedure "
+                    "cannot meaningfully converge to this; expect to "
+                    "exhaust max_iterations.",
+                    c.convergence_threshold_urad, floor)
+            else:
+                log.info("convergence threshold = %.1f urad "
+                         "(operator-supplied; floor is %.1f urad)",
+                         c.convergence_threshold_urad, floor)
 
     # ---- gated motion helpers --------------------------------------------
 
@@ -808,18 +898,20 @@ class DetectorZRailAlignment:
         """Iterative correction using M_inv @ -slope, with damping
         and a divergence guard.
 
-        ΔAY, ΔAX (urad) such that
-            M @ (ΔAY, ΔAX) = -(slope_X, slope_Y)
-        nominally drives the slope to zero. With table cross-coupling
-        and finite calibration accuracy, a damping factor < 1 keeps
-        us in the linear range across iterations. If |slope| grows
-        from one iter to the next by more than ``divergence_grow_threshold``,
-        we abort -- the restore path puts table AY/AX back to baseline.
+        Tracks the best |tilt| seen across iterations along with the
+        table pose at that measurement. If ``max_iterations`` is hit
+        without satisfying the convergence threshold, and the best
+        |tilt| is strictly better than the starting state, the table
+        is moved back to that best pose and the run is declared a
+        "soft commit" (``self._best_state_committed = True``). The
+        finally-block in ``run()`` then leaves the table at the best
+        pose instead of restoring it to baseline.
         """
         c = self.config
+        threshold = self._convergence_threshold_urad
         log.info("iterate (max_iterations=%d, threshold=%.1f urad, "
                  "damping=%.2f, divergence_grow_threshold=%.2fx)",
-                 c.max_iterations, c.convergence_threshold_urad,
+                 c.max_iterations, threshold,
                  c.damping, c.divergence_grow_threshold)
 
         deg_per_urad = 5.72958e-5
@@ -831,12 +923,35 @@ class DetectorZRailAlignment:
                                "(re-calibrate with larger step)") from exc
 
         prev_slope_mag = None
+        # Best-state tracking. The "starting" pose is the table state at
+        # iter 1's measurement (== baseline). best_pose is updated each
+        # time a strictly better |tilt| is seen.
+        starting_tilt_mag: float | None = None
+        best_iter = 0
+        best_tilt_mag = float("inf")
+        best_AY = self.baseline.table_AY
+        best_AX = self.baseline.table_AX
 
         for i in range(1, c.max_iterations + 1):
+            # Record pose at this measurement (before the iteration's
+            # correction is applied). For iter 1 this is the baseline;
+            # for iter N>1 it's the pose set by iter N-1's correction.
+            pose_AY = float(caget(PV_TABLE_AY))
+            pose_AX = float(caget(PV_TABLE_AX))
+
             x_n, y_n, x_f, y_f, slope_X, slope_Y = self._measure_slope()
             tilt_X = slope_X * 1000.0
             tilt_Y = slope_Y * 1000.0
             slope_mag = math.hypot(tilt_X, tilt_Y)
+            if starting_tilt_mag is None:
+                starting_tilt_mag = slope_mag
+
+            # Update best state if this measurement beats the prior best.
+            if slope_mag < best_tilt_mag:
+                best_iter = i
+                best_tilt_mag = slope_mag
+                best_AY = pose_AY
+                best_AX = pose_AX
 
             # Divergence guard
             if (prev_slope_mag is not None and
@@ -853,8 +968,8 @@ class DetectorZRailAlignment:
                 )
             prev_slope_mag = slope_mag
 
-            converged = (abs(tilt_X) <= c.convergence_threshold_urad
-                         and abs(tilt_Y) <= c.convergence_threshold_urad)
+            converged = (abs(tilt_X) <= threshold
+                         and abs(tilt_Y) <= threshold)
 
             result = IterationResult(
                 iteration=i,
@@ -906,8 +1021,30 @@ class DetectorZRailAlignment:
                 new_AY, new_AX,
                 f"iteration {i}: apply corrective table tilt")
 
-        log.warning("did not converge after %d iterations",
-                    c.max_iterations)
+        # max_iterations exhausted. Decide whether the best state is
+        # worth committing to.
+        log.warning("did not converge after %d iterations "
+                    "(threshold %.1f urad)", c.max_iterations, threshold)
+        log.info("best state: iter %d, |tilt|=%.1f urad, "
+                 "table.AY=%.6g deg, table.AX=%.6g deg",
+                 best_iter, best_tilt_mag, best_AY, best_AX)
+        log.info("starting |tilt| was %.1f urad", starting_tilt_mag)
+        if best_tilt_mag < starting_tilt_mag:
+            improvement_pct = (1.0 - best_tilt_mag / starting_tilt_mag) * 100
+            log.info("commit-to-best: moving table to best-state pose "
+                     "(%.1f%% improvement vs starting)", improvement_pct)
+            if not c.dry_run:
+                self._gated_move_table_pair(
+                    best_AY, best_AX,
+                    f"post-iteration: commit to best pose "
+                    f"(iter {best_iter}, |tilt|={best_tilt_mag:.1f} urad)")
+            self._best_state_committed = True
+        else:
+            log.warning("no improvement over starting state "
+                        "(best %.1f urad >= start %.1f urad); "
+                        "restore path will return table to baseline.",
+                        best_tilt_mag, starting_tilt_mag)
+            self._best_state_committed = False
         return False
 
     # ---- orchestrator ----------------------------------------------------
@@ -916,6 +1053,7 @@ class DetectorZRailAlignment:
         c = self.config
 
         self.detect_camera_and_lens()
+        self._resolve_convergence_threshold()
         self._snapshot = _Snapshot.capture(self._cam_prefix)
         log.info("snapshotted pre-procedure state (camera + Z); "
                  "will restore on exit")
@@ -960,12 +1098,16 @@ class DetectorZRailAlignment:
             return False
         finally:
             if self._snapshot is not None:
-                # Table AY/AX get restored on every exit path EXCEPT a
-                # clean convergence -- if the procedure ran to a converged
-                # alignment, those new values are the deliberate output
-                # and should stay in place. On abort, exception, or
-                # max-iterations-exceeded, put the table back to baseline.
-                restore_table = not converged
+                # Table AY/AX get restored on every exit path EXCEPT:
+                #  - clean convergence (new values are the deliberate
+                #    output), OR
+                #  - max-iterations-without-convergence but the best
+                #    |tilt| beat the starting state -- iterate() has
+                #    already moved the table back to the best pose and
+                #    set self._best_state_committed = True.
+                # On OperatorAbort, exception, or max-iter with no net
+                # improvement, table goes back to baseline.
+                restore_table = not (converged or self._best_state_committed)
                 log.info("restoring pre-procedure state "
                          "(table AY/AX restored: %s)",
                          "yes" if restore_table else
@@ -1015,9 +1157,20 @@ def _build_argparser() -> argparse.ArgumentParser:
                         "fails with a near-singular determinant, try 100.")
     p.add_argument("--exposure-time", type=float, default=0.05,
                    help="Camera exposure (s). Default: 0.05.")
-    p.add_argument("--convergence-urad", type=float, default=5.0,
+    p.add_argument("--convergence-urad", type=float, default=None,
                    help="Stop iterating when |tilt_X|, |tilt_Y| are below "
-                        "this. Default: 5 urad.")
+                        "this (urad). DEFAULT: auto-computed from the "
+                        "detected lens + binning + dz + rail straightness "
+                        "floor x --convergence-safety-margin. Operator "
+                        "override wins; a warning is logged if the "
+                        "override is below the physical noise floor.")
+    p.add_argument("--convergence-safety-margin", type=float, default=1.5,
+                   help="Multiplier on the noise floor when auto-computing "
+                        "the convergence threshold. Default: 1.5.")
+    p.add_argument("--centroid-noise-pix", type=float, default=1.0,
+                   help="Assumed centroid-fit noise in pixels, used by "
+                        "the auto-threshold calculation. Default: 1.0 "
+                        "(typical for COM on a clean spot).")
     p.add_argument("--max-iterations", type=int, default=5)
     p.add_argument("--damping", type=float, default=0.5,
                    help="Damping factor 0 < d <= 1 on the computed iteration "
@@ -1072,6 +1225,8 @@ def main(argv: list[str] | None = None) -> int:
         z_calibration_step_urad=args.calibration_step_urad,
         exposure_time=args.exposure_time,
         convergence_threshold_urad=args.convergence_urad,
+        convergence_safety_margin=args.convergence_safety_margin,
+        centroid_noise_pix=args.centroid_noise_pix,
         max_iterations=args.max_iterations,
         damping=args.damping,
         divergence_grow_threshold=args.divergence_threshold,
