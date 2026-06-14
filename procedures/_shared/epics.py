@@ -101,20 +101,33 @@ def caput_wait(pvname: str, value, dmov_pvname: str | None = None,
                timeout: float = 30.0):
     """``caput`` + wait for completion.
 
-    If ``dmov_pvname`` is given, wait until that bool PV reads 1
-    (typical for motor records — pass ``<motor>.DMOV``). Otherwise
-    fall back to ``ca_put(wait=True)`` semantics.
+    Always uses put-callback (``ca_put(wait=True)``). For a motor
+    record's ``.VAL`` field the put-callback fires when the record
+    completes its processing chain -- which for the motor record is
+    DMOV=1 (motion done). This is the correct way to wait for motor
+    motion; the previous "caput + poll DMOV" approach had a race
+    where caget could see the *old* DMOV=1 before the motor record
+    had set DMOV=0 to indicate motion in progress, causing the
+    function to return before motion had even started.
+
+    If ``dmov_pvname`` is given, a belt-and-suspenders DMOV=1 check
+    is performed after the put-callback returns -- if DMOV is still
+    0 within 5 s of put-callback completion, ``TimeoutError`` is
+    raised.
     """
     log.debug("caput %s = %s", pvname, value)
-    caput(pvname, value, wait=(dmov_pvname is None), timeout=timeout)
+    caput(pvname, value, wait=True, timeout=timeout)
     if dmov_pvname is None:
         return
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         if int(caget(dmov_pvname) or 0) == 1:
             return
         time.sleep(0.05)
-    raise TimeoutError(f"{dmov_pvname} did not reach DMOV=1 within {timeout} s")
+    raise TimeoutError(
+        f"after put-callback {pvname}={value} completed, "
+        f"{dmov_pvname} is still 0 -- motor not idle?"
+    )
 
 
 def cawait_value(pvname: str, target, timeout: float = 30.0,
@@ -180,11 +193,24 @@ def move_table_axis(soft_pv: str, value: float,
         ``.DMOV`` is appended to each internally.
     """
     log.debug("table soft-move %s = %s", soft_pv, value)
-    caput(soft_pv, value)
-    # Small grace period so the cascade reaches the jacks and DMOV
-    # drops to 0 before we start polling for it to come back to 1.
-    time.sleep(0.25)
     dmov_pvs = [f"{prefix}.DMOV" for prefix in jack_motor_prefixes]
+    caput(soft_pv, value)
+    # Phase 1: wait up to 2 s for ANY jack DMOV to drop to 0
+    # (motion started). If none drops the kinematic engine probably
+    # computed a sub-resolution change and no jack moved; treat as
+    # a no-op success.
+    grace_deadline = time.monotonic() + 2.0
+    motion_started = False
+    while time.monotonic() < grace_deadline:
+        if any(int(caget(p) or 0) == 0 for p in dmov_pvs):
+            motion_started = True
+            break
+        time.sleep(0.05)
+    if not motion_started:
+        log.debug("table %s = %s: no jack DMOV dropped within 2 s "
+                  "(sub-resolution / no-op)", soft_pv, value)
+        return
+    # Phase 2: wait for all jack DMOVs to come back to 1 (all done).
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if all(int(caget(p) or 0) == 1 for p in dmov_pvs):
