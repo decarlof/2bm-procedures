@@ -283,16 +283,22 @@ def acquire_image(cam_prefix: str, image_prefix: str | None = None,
     if arr is None:
         raise RuntimeError(f"image fetch returned None from {image_prefix}ArrayData")
     img = np.asarray(arr).reshape((height, width))
-
-    pixel_format = caget(f"{cam_prefix}cam1:PixelFormat_RBV",
-                         as_string=True) or "Mono8"
-    if pixel_format.startswith("Mono16"):
-        bits = 16
-    elif pixel_format.startswith("Mono12"):
-        bits = 12
-    else:
-        bits = 8
-    img = np.mod(img.astype("int32"), 2**bits).astype("uint16")
+    # Cast through uint16. caget for an unsigned PV may return signed
+    # ints on some pyepics versions; this handles both cases without
+    # changing the magnitudes (uint16 cast preserves the bit pattern
+    # which is what we want when the underlying storage is unsigned).
+    img = img.astype(np.uint16)
+    # No bit-depth wraparound. Earlier versions applied
+    # ``np.mod(img, 2**bits)`` here, mirroring the align-main
+    # take_image() reference -- but on the 2-BM Oryx 31MP via
+    # MCTOptics the camera delivers Mono12Packed left-shifted into
+    # uint16 (4095 -> 65520), NOT raw 12-bit. The mod-4096
+    # collapsed the saturated pixels (65520) down to ~3120, which
+    # completely reshuffled "which pixels are brightest" and made
+    # COM lock onto random clusters instead of the actual spot.
+    # Centroid algorithms work on relative intensities, so the
+    # absolute dynamic range (12-bit vs 12-bit-shifted-into-16-bit)
+    # doesn't matter -- pass the raw uint16 through.
     return img
 
 
