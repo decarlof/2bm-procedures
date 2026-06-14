@@ -465,7 +465,11 @@ class DetectorZRailAlignment:
             "calibration: restore AX",
         )
 
-        if (abs(self.jacobian.J_AY_X) < c.min_jacobian_um_per_urad
+        # Sanity-floor check would always trip in dry-run (centroids are
+        # stubbed to (0,0), so every Jacobian element is exactly zero).
+        # Skip it -- the whole point of dry-run is to walk the steps.
+        if not c.dry_run and (
+                abs(self.jacobian.J_AY_X) < c.min_jacobian_um_per_urad
                 or abs(self.jacobian.J_AX_Y) < c.min_jacobian_um_per_urad):
             raise RuntimeError(
                 f"Jacobian below sanity floor "
