@@ -304,9 +304,31 @@ def acquire_image(cam_prefix: str, image_prefix: str | None = None,
 def safe_restore(actions: Sequence[tuple[str, Callable[[], None]]]) -> None:
     """Execute each ``(label, callable)`` in order. If any raises, log a
     warning and continue. Used by procedure ``_Snapshot.restore()``
-    methods so one bad PV doesn't block restoring the others."""
-    for label, fn in actions:
+    methods so one bad PV doesn't block restoring the others.
+
+    ``KeyboardInterrupt`` is caught per-action too -- the design
+    contract is that restore runs to completion regardless of how the
+    procedure aborted, including a panic-Ctrl-C from the operator
+    during the restore itself. The operator can still interrupt a
+    truly-hung action by hitting Ctrl-C three times in a row (catches
+    accumulate; eventually KeyboardInterrupt propagates out).
+    """
+    interrupt_count = 0
+    for i, (label, fn) in enumerate(actions):
         try:
             fn()
+            interrupt_count = 0  # reset on any successful action
+        except KeyboardInterrupt:
+            interrupt_count += 1
+            remaining = len(actions) - i - 1
+            log.warning("restore %s interrupted by Ctrl-C; continuing "
+                        "with remaining %d action(s) (Ctrl-C %d/3 -- "
+                        "press 3 times in a row to abort restore)",
+                        label, remaining, interrupt_count)
+            if interrupt_count >= 3:
+                log.error("restore aborted after 3 consecutive Ctrl-C; "
+                          "remaining actions skipped; PVs may be in "
+                          "inconsistent state -- restore manually")
+                raise
         except Exception as exc:
             log.warning("restore %s failed: %s", label, exc)

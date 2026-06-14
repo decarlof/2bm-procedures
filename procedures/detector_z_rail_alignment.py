@@ -311,6 +311,16 @@ class Config:
     # Abort if |slope| grows by more than this factor from one iter
     # to the next -- protection against runaway divergence.
     divergence_grow_threshold: float = 1.5
+    # Abort if |slope| exceeds the best |slope| seen so far in this
+    # run by more than this factor. Catches the slow-bleed divergence
+    # that the per-step ratio misses (e.g. 1.2x per iter over 9 iters
+    # = 5x cumulative, well past anything useful).
+    divergence_cumulative_threshold: float = 2.0
+    # Warn at this condition number of the sensitivity matrix M --
+    # higher than this means one axis-direction has marginal SNR and
+    # the procedure is at risk of sign-flip divergence. Doesn't auto-
+    # abort; operator can choose to proceed.
+    sensitivity_cond_warn_threshold: float = 5.0
     # If True, prompt y/N before each Z measurement move. If False
     # (default), Z measurement moves are announced but not gated --
     # they stay within the [Z_GUARD_MIN, Z_GUARD_MAX] band and don't
@@ -449,7 +459,19 @@ class _Snapshot:
         deliberate output and stay in place).
         """
         cp = self.cam_prefix
-        plan: list[dict] = [
+        plan: list[dict] = []
+        # Table FIRST -- matches the restore() execution order so the
+        # plan block reflects what actually runs first.
+        if restore_table:
+            plan.extend([
+                {"pv": PV_TABLE_AY, "current": "?",
+                 "target": self.table_AY, "units": "deg"},
+                {"pv": PV_TABLE_AX, "current": "?",
+                 "target": self.table_AX, "units": "deg"},
+            ])
+        plan.extend([
+            {"pv": PV_OP_Z_MOTOR, "current": "?",
+             "target": self.z_position, "units": "mm"},
             {"pv": f"{cp}cam1:Acquire", "current": "?", "target": 0,
              "units": "(stop if running)"},
             {"pv": f"{cp}cam1:TriggerMode", "current": "?",
@@ -468,24 +490,48 @@ class _Snapshot:
              "target": self.cam_exposure_mode, "units": ""},
             {"pv": f"{cp}cam1:ArrayCallbacks", "current": "?",
              "target": self.cam_array_callbacks, "units": ""},
-            {"pv": PV_OP_Z_MOTOR, "current": "?",
-             "target": self.z_position, "units": "mm"},
-        ]
-        if restore_table:
-            plan.extend([
-                {"pv": PV_TABLE_AY, "current": "?",
-                 "target": self.table_AY, "units": "deg"},
-                {"pv": PV_TABLE_AX, "current": "?",
-                 "target": self.table_AX, "units": "deg"},
-            ])
+        ])
         if self.cam_was_acquiring:
             plan.append({"pv": f"{cp}cam1:Acquire", "current": 0,
                          "target": 1, "units": "(resume)"})
         return plan
 
     def restore(self, restore_table: bool = True) -> None:
+        """Restore PVs in priority order:
+
+        1. Table AY/AX (highest priority -- affects alignment
+           fundamentally, hardest to fix by hand, six jacks to
+           coordinate). Skipped if ``restore_table=False`` (i.e. clean
+           convergence wants to keep the new alignment).
+        2. Z stage (moderate priority -- one motor, easy to recover
+           manually if needed).
+        3. Camera state (low priority -- nine caputs, all to fixed
+           values; trivial to recover manually).
+
+        Ordering matters when restore is interrupted (operator
+        Ctrl-C during the restore itself): the most safety-critical
+        PVs go back first, even if the rest never runs. See
+        ``safe_restore`` for the per-action Ctrl-C handling.
+        """
         cp = self.cam_prefix
-        actions = [
+        actions = []
+        if restore_table:
+            # Table FIRST -- the most safety-critical restore (six
+            # jacks, kinematic coordination, alignment-defining).
+            actions.extend([
+                ("table.AY to baseline",
+                 lambda: move_table_axis(PV_TABLE_AY, self.table_AY,
+                                          TABLE_JACK_PREFIXES, timeout=60)),
+                ("table.AX to baseline",
+                 lambda: move_table_axis(PV_TABLE_AX, self.table_AX,
+                                          TABLE_JACK_PREFIXES, timeout=60)),
+            ])
+        actions.extend([
+            # Z stage second.
+            ("Z stage to baseline",
+             lambda: move_motor(PV_OP_Z_MOTOR, self.z_position, timeout=180)),
+            # Camera state last -- a stranded camera config is the
+            # easiest of the three categories to fix manually.
             ("stop in-progress acquire",
              lambda: caput(f"{cp}cam1:Acquire", 0, wait=True, timeout=5.0)),
             ("cam TriggerMode",
@@ -512,18 +558,7 @@ class _Snapshot:
             ("cam ArrayCallbacks",
              lambda: caput(f"{cp}cam1:ArrayCallbacks",
                            self.cam_array_callbacks, wait=True)),
-            ("Z stage to baseline",
-             lambda: move_motor(PV_OP_Z_MOTOR, self.z_position, timeout=180)),
-        ]
-        if restore_table:
-            actions.extend([
-                ("table.AY to baseline",
-                 lambda: move_table_axis(PV_TABLE_AY, self.table_AY,
-                                          TABLE_JACK_PREFIXES, timeout=60)),
-                ("table.AX to baseline",
-                 lambda: move_table_axis(PV_TABLE_AX, self.table_AX,
-                                          TABLE_JACK_PREFIXES, timeout=60)),
-            ])
+        ])
         if self.cam_was_acquiring:
             actions.append(("resume continuous acquire",
                             lambda: caput(f"{cp}cam1:Acquire", 1)))
@@ -883,9 +918,17 @@ class DetectorZRailAlignment:
             log.info("  singular values: %.3e, %.3e   condition number: %.1f",
                      sv[0], sv[1], cond)
             if cond > 100:
-                log.warning("  high condition number -- table has weak "
+                log.warning("  VERY high condition number -- table has weak "
                             "control over one slope direction; expect "
                             "convergence in only the dominant direction.")
+            elif cond > c.sensitivity_cond_warn_threshold:
+                log.warning("  elevated condition number %.1f (warn at "
+                            "%.1f). One column of M has marginal SNR; "
+                            "the sign of the weaker entry may be noise. "
+                            "If iteration diverges, abort and re-run "
+                            "calibrate with a larger "
+                            "--calibration-step-urad (try 100 or 200).",
+                            cond, c.sensitivity_cond_warn_threshold)
         except Exception as exc:
             log.debug("SVD diagnostic failed: %s", exc)
 
@@ -961,19 +1004,49 @@ class DetectorZRailAlignment:
                 best_AY = pose_AY
                 best_AX = pose_AX
 
-            # Divergence guard
-            if (prev_slope_mag is not None and
-                    slope_mag > prev_slope_mag * c.divergence_grow_threshold and
-                    not c.dry_run):
-                log.error("DIVERGING at iter %d: |slope| grew from %.1f to "
-                          "%.1f urad", i, prev_slope_mag, slope_mag)
-                raise RuntimeError(
-                    f"divergence at iter {i}: |slope|={slope_mag:.1f} urad "
-                    f"exceeds previous {prev_slope_mag:.1f} urad by "
-                    f">{c.divergence_grow_threshold:.1f}x. Sensitivity "
-                    "matrix is inaccurate; re-calibrate with larger "
-                    "--calibration-step-urad."
-                )
+            # Divergence guards (two of them):
+            #
+            # 1. Per-iteration ratio: catches a single big step. Works
+            #    well for sudden divergence but misses slow-bleed cases
+            #    where each step grows by <1.5x but they accumulate.
+            #
+            # 2. Cumulative-vs-best ratio: catches the slow-bleed case.
+            #    If |slope| has grown to >2x its best-seen value, the
+            #    procedure has clearly gone the wrong way and isn't
+            #    recovering. Abort -- restore puts table back to
+            #    baseline. (best_tilt_mag was already updated above
+            #    before this check, so if THIS iter is the best,
+            #    slope_mag == best_tilt_mag and the check is moot.)
+            if not c.dry_run:
+                if (prev_slope_mag is not None and
+                        slope_mag > prev_slope_mag * c.divergence_grow_threshold):
+                    log.error("DIVERGING at iter %d: |slope| grew from %.1f "
+                              "to %.1f urad", i, prev_slope_mag, slope_mag)
+                    raise RuntimeError(
+                        f"divergence at iter {i}: |slope|={slope_mag:.1f} "
+                        f"urad exceeds previous {prev_slope_mag:.1f} urad "
+                        f"by >{c.divergence_grow_threshold:.1f}x. "
+                        "Sensitivity matrix may be inaccurate; "
+                        "re-calibrate with larger --calibration-step-urad."
+                    )
+                if (best_tilt_mag < float("inf") and
+                        slope_mag > best_tilt_mag *
+                        c.divergence_cumulative_threshold):
+                    log.error("DIVERGING (cumulative) at iter %d: "
+                              "|slope|=%.1f urad exceeds best-seen "
+                              "%.1f urad (iter %d) by >%.1fx",
+                              i, slope_mag, best_tilt_mag, best_iter,
+                              c.divergence_cumulative_threshold)
+                    raise RuntimeError(
+                        f"cumulative divergence at iter {i}: |slope|"
+                        f"={slope_mag:.1f} urad has grown to >"
+                        f"{c.divergence_cumulative_threshold:.1f}x the "
+                        f"best |slope|={best_tilt_mag:.1f} urad seen "
+                        f"(iter {best_iter}). Procedure isn't recovering; "
+                        "calibration likely has a sign error on one "
+                        "axis. Re-calibrate with larger "
+                        "--calibration-step-urad (try 100 or 200)."
+                    )
             prev_slope_mag = slope_mag
 
             converged = (abs(tilt_X) <= threshold
@@ -1188,6 +1261,18 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--divergence-threshold", type=float, default=1.5,
                    help="Abort if |slope| grows by more than this factor "
                         "from one iteration to the next. Default: 1.5.")
+    p.add_argument("--divergence-cumulative-threshold", type=float,
+                   default=2.0,
+                   help="Abort if |slope| exceeds the best |slope| seen "
+                        "so far by more than this factor. Catches slow-"
+                        "bleed divergence that the per-step ratio misses. "
+                        "Default: 2.0.")
+    p.add_argument("--sensitivity-cond-warn-threshold", type=float,
+                   default=5.0,
+                   help="Log a warning if the calibrated sensitivity-matrix "
+                        "condition number exceeds this. Default: 5.0. "
+                        "Doesn't auto-abort -- operator can choose to "
+                        "proceed and rely on the divergence guards.")
     p.add_argument("--max-correction-urad", type=float, default=200.0,
                    help="Hard clip on per-iteration correction magnitude "
                         "for each table axis. Default: 200 urad. Keeps "
@@ -1238,6 +1323,8 @@ def main(argv: list[str] | None = None) -> int:
         max_iterations=args.max_iterations,
         damping=args.damping,
         divergence_grow_threshold=args.divergence_threshold,
+        divergence_cumulative_threshold=args.divergence_cumulative_threshold,
+        sensitivity_cond_warn_threshold=args.sensitivity_cond_warn_threshold,
         max_correction_per_iter_urad=args.max_correction_urad,
         threshold_fraction=args.threshold_fraction,
         camera_pixel_um=args.camera_pixel_um,
