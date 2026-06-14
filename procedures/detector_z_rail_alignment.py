@@ -138,12 +138,13 @@ Z_GUARD_MAX_MM = 500.0
 PRECONDITIONS = [
     {
         "state": "beamline_enabled",
-        "description": "Hutches searched + locked; BLEPS clear; APS "
-                       "delivering beam; FES permit granted.",
+        "description": "Hutches searched + locked; ACIS upstream permit "
+                       "(composites BLEPS + machine state); FES open.",
         "predicate": "S02BM-PSS:StaA:SecureM == 1 (ON)  AND  "
                      "S02BM-PSS:StaB:SecureM == 1 (ON)  AND  "
                      "S02BM-PSS:FES:BeamBlockingM == 0 (OFF)  AND  "
-                     "BLEPS clear (TBD)  AND  APS delivering beam (TBD)",
+                     "SR-ACIS:2BM:FesPermitM == 1 (ON, ACIS upstream "
+                     "permit; aggregates BLEPS + APS machine state)",
         "satisfied_by": "enable_beamline",
         "doc": "procedures/item_003.rst",
     },
