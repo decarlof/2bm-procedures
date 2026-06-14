@@ -132,6 +132,14 @@ class Config:
     # skip rezeroing while keeping the centred + closed state.
     rezero: bool = True
 
+    # Phase 4: reopen slits to the snapshot's original H/V size.
+    # Default ON. Runs whether or not rezero ran; if rezero ran,
+    # the reopen target is interpreted in the new coordinate system
+    # (slits open to the original aperture size, centred on the new
+    # origin which is the beam axis). Gated per axis. --no-reopen
+    # leaves the slits closed.
+    reopen: bool = True
+
     # Image acquisition
     exposure_time: float = 0.2
     centroid_algorithm: str = "com"
@@ -773,6 +781,34 @@ class CentreAndCloseSlits:
         self._gated_rezero_axis("H")
         self._gated_rezero_axis("V")
 
+    # ---- phase 4: reopen --------------------------------------------------
+
+    def reopen_slits(self) -> None:
+        """Phase 4: reopen slits to the original H/V size (from snapshot).
+
+        If phase 3 (rezero) ran, the reopen target is interpreted in
+        the new coordinate system: the slits open by the original
+        aperture (e.g. 1 mm) centred on the new origin -- which is the
+        beam axis the procedure just calibrated. If rezero was skipped
+        the original Hsize/Vsize are still meaningful as aperture
+        magnitudes (Hsize is an absolute size, independent of origin).
+
+        Each axis gated. ``--no-reopen`` skips this phase, leaving the
+        slits closed.
+        """
+        h_target = self._snapshot.slit_h_size_mm
+        v_target = self._snapshot.slit_v_size_mm
+        log.info("reopen phase: open slits to original aperture "
+                 "(H=%.3f mm, V=%.3f mm)%s",
+                 h_target, v_target,
+                 " in new coordinate system" if self._rezero_started else "")
+        self._gated_move_slit(
+            "Hsize", h_target,
+            f"reopen: H size 0 -> {h_target:.3f} mm")
+        self._gated_move_slit(
+            "Vsize", v_target,
+            f"reopen: V size 0 -> {v_target:.3f} mm")
+
     # ---- shared helpers ---------------------------------------------------
 
     def _centroid_failure_message(self, reason: str) -> str:
@@ -835,6 +871,13 @@ class CentreAndCloseSlits:
                     if cora:
                         cora.append_step(
                             "rezero", {"rezero_started": self._rezero_started})
+                if c.reopen:
+                    self.reopen_slits()
+                    if cora:
+                        cora.append_step(
+                            "reopen",
+                            {"h_size_mm": self._snapshot.slit_h_size_mm,
+                             "v_size_mm": self._snapshot.slit_v_size_mm})
             else:
                 log.warning("skipping close phase because centring did not "
                             "converge to threshold (best state was committed)")
@@ -929,6 +972,14 @@ def _build_argparser() -> argparse.ArgumentParser:
                         "new origin. Each H and V rezero is gated "
                         "separately and IRREVERSIBLE -- once issued, "
                         "the snapshot restore for slits is disabled.")
+    # Phase 4
+    p.add_argument("--no-reopen", action="store_true",
+                   help="Skip the reopen phase (default: reopen is "
+                        "enabled). When enabled, the procedure's final "
+                        "step is to caput Hsize/Vsize back to the "
+                        "snapshot's original values (e.g. 1 mm), so the "
+                        "slits end up open at the original aperture, "
+                        "centred on the (possibly new) origin.")
     # Image acquisition
     p.add_argument("--exposure-time", type=float, default=0.2,
                    help="Camera exposure (s). Default: 0.2.")
@@ -976,6 +1027,7 @@ def main(argv: list[str] | None = None) -> int:
         target_h_size_mm=args.target_h_size_mm,
         target_v_size_mm=args.target_v_size_mm,
         rezero=(not args.no_rezero),
+        reopen=(not args.no_reopen),
         exposure_time=args.exposure_time,
         centroid_algorithm=args.centroid_algorithm,
         threshold_fraction=args.threshold_fraction,
