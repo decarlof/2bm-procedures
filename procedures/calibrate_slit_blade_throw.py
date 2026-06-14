@@ -111,9 +111,12 @@ class Config:
     # OUT than baseline).
     edge_roi_half_size_pix: int = 400
 
-    # Background statistics + threshold for bbox detection.
-    bg_corner_size: int = 80
-    bg_sigma_threshold: float = 5.0
+    # Aperture-edge detection: half-max crossings of 1D row/column
+    # profiles, with subpixel linear interpolation. Robust against
+    # halo + multilayer-stripe noise that defeated the earlier
+    # 2D bbox-of-above-threshold approach.
+    aperture_edge_level: float = 0.5         # fraction of (p90 - p10)
+    aperture_min_dynamic_range: float = 100  # counts; below this, no spot
 
     # Camera
     exposure_time: float = 0.2
@@ -338,11 +341,20 @@ class CalibrateSlitBladeThrow:
         return com
 
     def _measure_bbox(self) -> dict | None:
-        """Measure bounding box of the bright region within an ROI
-        around the spot centre. Returns a dict
-        ``{'top', 'bottom', 'left', 'right'}`` in full-frame pixel
-        coordinates, or ``None`` if no bright pixels were found
-        (slit closed past the beam, or noise floor too high).
+        """Find the 4 edges of the slit-defined bright aperture using
+        half-max crossings of 1D row/column-averaged profiles.
+
+        For each axis: collapse the 2D ROI into a profile by averaging
+        across the perpendicular axis; compute robust min/max via the
+        10th/90th percentiles; threshold at ``p10 + level * (p90 - p10)``;
+        find the leftmost and rightmost samples above threshold; refine
+        each to subpixel position via linear interpolation between the
+        bracketing samples.
+
+        Returns a dict ``{'top', 'bottom', 'left', 'right'}`` in
+        full-frame pixel coordinates, or ``None`` if either axis lacks
+        enough dynamic range (slit closed past the beam, or detector
+        signal too low to define an edge).
         """
         c = self.config
         frame = self._acquire_frame()
@@ -355,44 +367,85 @@ class CalibrateSlitBladeThrow:
         x0 = max(0, cx - rh)
         x1 = min(w, cx + rh)
         roi = frame[y0:y1, x0:x1].astype(float)
-        # Sample background from the 4 corners of the ROI (small
-        # squares well outside the spot at baseline). Median + MAD
-        # for robustness.
-        cs = min(c.bg_corner_size, roi.shape[0] // 4, roi.shape[1] // 4)
-        if cs < 4:
-            log.warning("ROI too small for corner-based background")
+
+        h_profile = roi.mean(axis=0)   # intensity vs X (length = ROI width)
+        v_profile = roi.mean(axis=1)   # intensity vs Y (length = ROI height)
+
+        h_edges = self._profile_half_max_crossings(
+            h_profile, c.aperture_edge_level, c.aperture_min_dynamic_range)
+        v_edges = self._profile_half_max_crossings(
+            v_profile, c.aperture_edge_level, c.aperture_min_dynamic_range)
+        if h_edges is None or v_edges is None:
+            log.warning("edge detection failed: "
+                        "h_profile range=%.0f (p10=%.0f, p90=%.0f); "
+                        "v_profile range=%.0f (p10=%.0f, p90=%.0f); "
+                        "min dynamic range = %.0f",
+                        np.percentile(h_profile, 90) - np.percentile(h_profile, 10),
+                        np.percentile(h_profile, 10),
+                        np.percentile(h_profile, 90),
+                        np.percentile(v_profile, 90) - np.percentile(v_profile, 10),
+                        np.percentile(v_profile, 10),
+                        np.percentile(v_profile, 90),
+                        c.aperture_min_dynamic_range)
             return None
-        bg = np.concatenate([
-            roi[:cs, :cs].ravel(),
-            roi[:cs, -cs:].ravel(),
-            roi[-cs:, :cs].ravel(),
-            roi[-cs:, -cs:].ravel(),
-        ])
-        bg_median = float(np.median(bg))
-        bg_mad = float(np.median(np.abs(bg - bg_median)))
-        bg_sigma = 1.4826 * bg_mad
-        threshold = bg_median + c.bg_sigma_threshold * bg_sigma
-        mask = roi > threshold
-        n_bright = int(mask.sum())
-        if n_bright < 50:
-            log.warning("bbox: only %d pixels above threshold %.0f "
-                        "(bg_median %.0f, sigma %.1f) -- spot too small "
-                        "or threshold too high", n_bright, threshold,
-                        bg_median, bg_sigma)
-            return None
-        ys, xs = np.where(mask)
+        left_sub, right_sub = h_edges
+        top_sub, bottom_sub = v_edges
         bbox = {
-            "top":    float(ys.min() + y0),
-            "bottom": float(ys.max() + y0),
-            "left":   float(xs.min() + x0),
-            "right":  float(xs.max() + x0),
+            "left":   float(left_sub + x0),
+            "right":  float(right_sub + x0),
+            "top":    float(top_sub + y0),
+            "bottom": float(bottom_sub + y0),
         }
-        log.info("bbox: top=%.0f bottom=%.0f left=%.0f right=%.0f "
-                 "(height=%.0f, width=%.0f, mask=%d pix, thr=%.0f)",
+        log.info("aperture edges @ %.0f%%-max: "
+                 "top=%.1f bottom=%.1f left=%.1f right=%.1f "
+                 "(height=%.1f, width=%.1f px); "
+                 "h_profile p10/p90=%.0f/%.0f, v_profile p10/p90=%.0f/%.0f",
+                 c.aperture_edge_level * 100,
                  bbox["top"], bbox["bottom"], bbox["left"], bbox["right"],
                  bbox["bottom"] - bbox["top"], bbox["right"] - bbox["left"],
-                 n_bright, threshold)
+                 np.percentile(h_profile, 10), np.percentile(h_profile, 90),
+                 np.percentile(v_profile, 10), np.percentile(v_profile, 90))
         return bbox
+
+    @staticmethod
+    def _profile_half_max_crossings(
+            profile: np.ndarray, level: float, min_dynamic_range: float):
+        """Find left and right crossings of (p10 + level * (p90 - p10))
+        in a 1D profile, with subpixel linear interpolation between
+        bracketing samples.
+
+        Returns (left_pos, right_pos) in profile-array indices (floats)
+        or None if (p90 - p10) is below ``min_dynamic_range`` (the
+        profile is too flat to define an edge -- e.g. slit closed past
+        the beam, so the profile is uniform background).
+        """
+        p_lo = float(np.percentile(profile, 10))
+        p_hi = float(np.percentile(profile, 90))
+        if (p_hi - p_lo) < min_dynamic_range:
+            return None
+        thr = p_lo + level * (p_hi - p_lo)
+        above = profile > thr
+        if not above.any():
+            return None
+        left_idx = int(np.argmax(above))
+        if 0 < left_idx < len(profile):
+            v0, v1 = profile[left_idx - 1], profile[left_idx]
+            if v1 > v0:
+                left_pos = (left_idx - 1) + (thr - v0) / (v1 - v0)
+            else:
+                left_pos = float(left_idx)
+        else:
+            left_pos = float(left_idx)
+        right_idx = len(profile) - 1 - int(np.argmax(above[::-1]))
+        if 0 <= right_idx < len(profile) - 1:
+            v0, v1 = profile[right_idx], profile[right_idx + 1]
+            if v0 > v1:
+                right_pos = right_idx + (v0 - thr) / (v0 - v1)
+            else:
+                right_pos = float(right_idx)
+        else:
+            right_pos = float(right_idx)
+        return left_pos, right_pos
 
     # ---- gated motion helpers --------------------------------------------
 
@@ -620,13 +673,15 @@ def _build_argparser() -> argparse.ArgumentParser:
                         "for bbox edge detection. Must be large enough to "
                         "contain the spot at +blade-throw-mm (one edge "
                         "moves further out than baseline). Default: 400 pix.")
-    p.add_argument("--bg-corner-size", type=int, default=80,
-                   help="Per-side length of the four ROI-corner boxes used "
-                        "to estimate background median+MAD for the bbox "
-                        "threshold. Default: 80.")
-    p.add_argument("--bg-sigma-threshold", type=float, default=5.0,
-                   help="Bbox threshold = bg_median + N*sigma (sigma from "
-                        "MAD). Default: 5.0.")
+    p.add_argument("--aperture-edge-level", type=float, default=0.5,
+                   help="Fraction of (p90 - p10) of the 1D profile used as "
+                        "the threshold for edge crossings. 0.5 = half-max, "
+                        "which matches the geometric slit-blade position "
+                        "for a sharp edge with penumbra. Default: 0.5.")
+    p.add_argument("--aperture-min-dynamic-range", type=float, default=100.0,
+                   help="If (p90 - p10) of either the H or V profile is "
+                        "below this many counts the procedure treats the "
+                        "spot as not visible. Default: 100.")
     p.add_argument("--exposure-time", type=float, default=0.2,
                    help="Camera exposure (s). Default: 0.2.")
     p.add_argument("--threshold-fraction", type=float, default=0.5,
@@ -657,8 +712,8 @@ def main(argv: list[str] | None = None) -> int:
         slit_station=args.slit_station,
         blade_throw_mm=args.blade_throw_mm,
         edge_roi_half_size_pix=args.edge_roi_half_size_pix,
-        bg_corner_size=args.bg_corner_size,
-        bg_sigma_threshold=args.bg_sigma_threshold,
+        aperture_edge_level=args.aperture_edge_level,
+        aperture_min_dynamic_range=args.aperture_min_dynamic_range,
         exposure_time=args.exposure_time,
         threshold_fraction=args.threshold_fraction,
         frames_per_measurement=args.frames_per_measurement,
