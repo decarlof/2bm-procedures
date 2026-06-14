@@ -168,8 +168,14 @@ PRECONDITIONS = [
     },
     {
         "state": "flag_in_beam",
-        "description": "Flag (future hardware) at in-beam Y position.",
-        "predicate": "TBD (flag not yet in hardware inventory)",
+        "description": "Diagnostic phosphor flag (2bma:m44, vertical) at "
+                       "the position appropriate for the beamline mode: "
+                       "0 mm (user) for pink, energy-dependent value from "
+                       "energy_move_flag in energy2bm.json for mono.",
+        "predicate": "2bma:m44.RBV ~ target_flag_y_mm  (target is mode-"
+                     "and-energy dependent; see "
+                     "energy-decarlof/src/energy/data/energy2bm.json key "
+                     "energy_move_flag for mono; 0 for pink).",
         "satisfied_by": "set_flag_in",
         "doc": "procedures/item_006.rst",
     },
