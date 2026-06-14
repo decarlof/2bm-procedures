@@ -289,6 +289,7 @@ class DetectorZRailAlignment:
         self._snapshot: _Snapshot | None = None
         self._cam_prefix: str = ""
         self._magnification: float = 1.0
+        self._pixel_um: float = config.camera_pixel_um   # auto-set by detect_*
 
         # Z-range guard (procedure-level safety band).
         if not (Z_GUARD_MIN_MM <= config.z_near < config.z_far <= Z_GUARD_MAX_MM):
@@ -335,9 +336,23 @@ class DetectorZRailAlignment:
         self._cam_prefix = CAMERA_PREFIXES_BY_INDEX[cam_idx]
         self._magnification = LENS_MAGNIFICATIONS_BY_INDEX[lens_idx]
 
-        log.info("detected: camera=%s [idx %d] -> %s, "
+        # Read camera binning so the effective pixel pitch reflects what
+        # image1:ArrayData actually delivers. A 2x2-binned 6480x4860 sensor
+        # returns 3240x2430 "pixels" each spanning two sensor pixels
+        # (effective pitch = 2 * sensor pitch).
+        bin_x = int(caget(f"{self._cam_prefix}cam1:BinX_RBV") or 1)
+        bin_y = int(caget(f"{self._cam_prefix}cam1:BinY_RBV") or 1)
+        if bin_x != bin_y:
+            log.warning("camera BinX=%d != BinY=%d -- using BinX for the "
+                        "pixel pitch; centroid x/y will be anisotropic",
+                        bin_x, bin_y)
+        self._pixel_um = self.config.camera_pixel_um * bin_x
+
+        log.info("detected: camera=%s [idx %d] -> %s (bin %dx%d, "
+                 "effective pixel pitch %.2f um); "
                  "lens=%s [idx %d] -> %.2fx magnification",
                  cam_label, cam_idx, self._cam_prefix,
+                 bin_x, bin_y, self._pixel_um,
                  lens_label, lens_idx, self._magnification)
 
     # ---- gated motion helpers --------------------------------------------
@@ -421,7 +436,7 @@ class DetectorZRailAlignment:
         dy_pix = py - h / 2.0
         x_um, y_um = pixels_to_object_um(
             com,
-            camera_pixel_um=self.config.camera_pixel_um,
+            camera_pixel_um=self._pixel_um,   # sensor pitch * binning
             magnification=self._magnification,
         )
         log.info("centroid: pix=(%.1f, %.1f) in %dx%d frame; "
@@ -661,8 +676,10 @@ def _build_argparser() -> argparse.ArgumentParser:
                    help="Centroid threshold as fraction of frame max. "
                         "Default: 0.5.")
     p.add_argument("--camera-pixel-um", type=float, default=3.45,
-                   help="Camera sensor pixel size (um). Default: 3.45 "
-                        "(Oryx 5MP / 31MP).")
+                   help="Camera SENSOR pixel pitch (um), pre-binning. "
+                        "Procedure multiplies by cam1:BinX_RBV at runtime "
+                        "to get the effective pixel pitch of the delivered "
+                        "image. Default: 3.45 (both Oryx 5MP and 31MP).")
     p.add_argument("--yes", action="store_true",
                    help="Auto-confirm every motion prompt (skip y/N gate). "
                         "Use for headless or scripted runs.")
