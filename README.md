@@ -4,8 +4,15 @@ Executable Python procedures for the APS 2-BM imaging beamline:
 alignments, baselines, recoveries, calibrations, and other episodic
 operational tasks.
 
+**Current release: [v0.0.1](CHANGELOG.md) (2026-06-14)** —
+`detector_z_rail_alignment` converges end-to-end on 2-BM-B
+(|tilt| 431 → 26 µrad in 5 iterations, M condition number 1.1).
+See [CHANGELOG.md](CHANGELOG.md) for the architecture, the
+cora-process mapping, the bug fixes that got us here, and the
+open follow-ups.
+
 Each procedure is **one file** in [`procedures/`](procedures/), named
-to match the corresponding [cora](https://github.com/xmap/cora)
+to match the corresponding [cora](https://github.com/xray-imaging/cora)
 `Procedure` slug. The human specification for each procedure lives
 in [`2bm-docs`](https://docs2bm.readthedocs.io/en/latest/source/procedures.html)
 under `procedures/`; this repo carries the executable implementation.
@@ -23,13 +30,15 @@ belong upstream there — they belong here.
 2bm-procedures/
 ├── procedures/
 │   ├── __init__.py
-│   ├── _shared/              # cross-procedure primitives
-│   │   ├── centroid.py       # COM / Gaussian centroid fit
-│   │   ├── epics.py          # PyEpics caget/caput/cawait helpers
-│   │   ├── cora_log.py       # optional cora Procedure-record API hook
-│   │   └── slits.py          # B-station slit composite helpers
-│   ├── detector_z_rail_alignment.py
-│   └── ...                   # one file per cora Procedure
+│   ├── _shared/                          # cross-procedure primitives
+│   │   ├── centroid.py                   # COM + background-thresholded geometric centroid
+│   │   ├── epics.py                      # PyEpics helpers, motion gates, restore primitives
+│   │   ├── log.py                        # ANSI-coloured console logger
+│   │   ├── cora_log.py                   # optional cora Procedure-record audit-spine hook
+│   │   └── slits.py                      # B-station slit composite helpers
+│   ├── detector_z_rail_alignment.py      # v0.0.1: field-tested on 2-BM-B
+│   └── ...                               # one file per cora Procedure
+├── CHANGELOG.md
 └── tests/
 ```
 
