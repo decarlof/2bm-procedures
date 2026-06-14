@@ -396,9 +396,17 @@ class DetectorZRailAlignment:
                             timeout=60)
 
     def _measure_centroid(self) -> tuple[float, float]:
-        if self.config.dry_run:
-            log.info("[dry-run] would acquire image and fit centroid")
-            return (0.0, 0.0)
+        """Acquire one image, fit centroid above threshold, return the
+        centroid position in object-side micrometres.
+
+        Runs in both dry-run and live modes -- only motor motion is
+        skipped under --dry-run; the camera read still happens so the
+        operator can validate the read+fit pipeline against the live
+        beam before committing to any motor motion. The pixel-space
+        centroid and its offset from the frame centre are logged so
+        the operator can confirm visually that the algorithm has
+        latched onto the bright spot they see on MEDM.
+        """
         frame = acquire_image(self._cam_prefix,
                               exposure_time=self.config.exposure_time)
         com = center_of_mass(frame, self.config.threshold_fraction)
@@ -407,11 +415,20 @@ class DetectorZRailAlignment:
                 "centroid fit failed: no signal above threshold "
                 "(slits too closed, beam off, shutter shut?)"
             )
-        return pixels_to_object_um(
+        h, w = frame.shape
+        px, py = com
+        dx_pix = px - w / 2.0
+        dy_pix = py - h / 2.0
+        x_um, y_um = pixels_to_object_um(
             com,
             camera_pixel_um=self.config.camera_pixel_um,
             magnification=self._magnification,
         )
+        log.info("centroid: pix=(%.1f, %.1f) in %dx%d frame; "
+                 "offset-from-centre=(%+.1f, %+.1f) pix; "
+                 "object-um=(%+.2f, %+.2f)",
+                 px, py, w, h, dx_pix, dy_pix, x_um, y_um)
+        return (x_um, y_um)
 
     # ---- procedure phases ------------------------------------------------
 
@@ -592,16 +609,20 @@ class DetectorZRailAlignment:
         finally:
             if self._snapshot is not None:
                 log.info("restoring pre-procedure state")
+                # Always announce + run restore -- even in dry-run, the
+                # acquire_image() calls mutate camera state (TriggerMode,
+                # ImageMode, NumImages) and we want those put back.
+                # The Z restore is a no-op when no Z move happened (move
+                # to current position).
                 confirm_motion(
                     self._snapshot.restore_plan(),
                     step_label="restore: returning camera + Z to "
                                "pre-procedure state",
-                    dry_run=c.dry_run,
+                    dry_run=False,            # restore is not gated by dry-run
                     auto_yes=c.auto_yes,
                     announce_only=(not c.confirm_restore),
                 )
-                if not c.dry_run:
-                    self._snapshot.restore()
+                self._snapshot.restore()
             if cora:
                 outcome = "complete" if (self.history
                                          and self.history[-1].converged) \
