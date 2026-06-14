@@ -146,7 +146,18 @@ class Config:
     # Minimum |det(M)| where M is the 2x2 slope-sensitivity matrix
     # (units: (um/mm)^2 / urad^2). Below this M is treated as
     # near-singular and calibration aborts with a clear message.
-    min_sensitivity_det: float = 1.0e-6
+    # Set very low (1e-8) because the safety net is now the
+    # max_correction_per_iter_urad clip + divergence guard + per-step
+    # operator gate -- a moderately ill-conditioned M can still drive
+    # useful corrections in its well-conditioned direction.
+    min_sensitivity_det: float = 1.0e-8
+    # Hard clip on |d_AY| and |d_AX| per iteration (urad). Even if M_inv
+    # computes a huge correction (because the table has weak authority
+    # in one direction and we're trying to fully zero the slope), apply
+    # at most this much per iteration. Keeps us in the linear range
+    # near the calibration point; convergence over more iterations
+    # rather than one big move.
+    max_correction_per_iter_urad: float = 200.0
     dry_run: bool = False
     auto_yes: bool = False
     confirm_restore: bool = False
@@ -616,6 +627,26 @@ class DetectorZRailAlignment:
                  M.M_AY_Y, M.M_AX_Y)
         log.info("  det(M) = %+.4e", det)
 
+        # SVD diagnostic: condition number tells the operator whether
+        # the procedure has independent control over both slopes. High
+        # cond (>10) means one axis-combination has weak slope authority
+        # -- corrections in that direction will be either ineffective
+        # (good: max-correction clip stops us pushing too hard) or
+        # over-amplified by M_inv (also clipped). Cond > 100 means
+        # convergence in one direction is essentially impossible with
+        # this table geometry.
+        try:
+            sv = np.linalg.svd(M.as_matrix(), compute_uv=False)
+            cond = sv[0] / sv[1] if sv[1] > 0 else float("inf")
+            log.info("  singular values: %.3e, %.3e   condition number: %.1f",
+                     sv[0], sv[1], cond)
+            if cond > 100:
+                log.warning("  high condition number -- table has weak "
+                            "control over one slope direction; expect "
+                            "convergence in only the dominant direction.")
+        except Exception as exc:
+            log.debug("SVD diagnostic failed: %s", exc)
+
         # Sanity check: M not near-singular. Skip in dry-run (centroids
         # are real but Z/table didn't move, so all measurements are at
         # the same physical state -> matrix is exactly zero).
@@ -698,16 +729,32 @@ class DetectorZRailAlignment:
                          "tilt_Y=%.2f urad", i, tilt_X, tilt_Y)
                 return True
 
-            # Solve M @ d = -slope for d = (dAY, dAX) in urad; damp.
+            # Solve M @ d = -slope for d = (dAY, dAX) in urad; damp,
+            # then clip each axis to max_correction_per_iter_urad.
+            # The clip keeps us in the linear range near the calibration
+            # point even if M_inv computes huge values (which happens
+            # when one slope direction has weak control authority).
             d = M_inv @ np.array([-slope_X, -slope_Y])
-            d_AY = float(d[0]) * c.damping
-            d_AX = float(d[1]) * c.damping
+            d_AY_raw = float(d[0]) * c.damping
+            d_AX_raw = float(d[1]) * c.damping
+            cap = c.max_correction_per_iter_urad
+            d_AY = max(-cap, min(cap, d_AY_raw))
+            d_AX = max(-cap, min(cap, d_AX_raw))
+            clipped = (d_AY != d_AY_raw) or (d_AX != d_AX_raw)
             result.correction_AY_urad = d_AY
             result.correction_AX_urad = d_AX
             self.history.append(result)
-            log.info("  iter %d: tilt_X=%+.2f, tilt_Y=%+.2f urad -> "
-                     "dAY=%+.2f urad, dAX=%+.2f urad (damped %.2fx)",
-                     i, tilt_X, tilt_Y, d_AY, d_AX, c.damping)
+            if clipped:
+                log.info("  iter %d: tilt_X=%+.2f, tilt_Y=%+.2f urad -> "
+                         "dAY=%+.2f urad, dAX=%+.2f urad "
+                         "(damped %.2fx, CLIPPED to +/- %.0f urad; raw was "
+                         "dAY=%+.2f dAX=%+.2f)",
+                         i, tilt_X, tilt_Y, d_AY, d_AX, c.damping, cap,
+                         d_AY_raw, d_AX_raw)
+            else:
+                log.info("  iter %d: tilt_X=%+.2f, tilt_Y=%+.2f urad -> "
+                         "dAY=%+.2f urad, dAX=%+.2f urad (damped %.2fx)",
+                         i, tilt_X, tilt_Y, d_AY, d_AX, c.damping)
 
             new_AY = float(caget(PV_TABLE_AY)) + d_AY * deg_per_urad
             new_AX = float(caget(PV_TABLE_AX)) + d_AX * deg_per_urad
@@ -836,6 +883,13 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--divergence-threshold", type=float, default=1.5,
                    help="Abort if |slope| grows by more than this factor "
                         "from one iteration to the next. Default: 1.5.")
+    p.add_argument("--max-correction-urad", type=float, default=200.0,
+                   help="Hard clip on per-iteration correction magnitude "
+                        "for each table axis. Default: 200 urad. Keeps "
+                        "corrections within the linear range of the "
+                        "calibration point when M-inversion computes a "
+                        "large value (which happens when the table has "
+                        "weak control authority in one slope direction).")
     p.add_argument("--threshold-fraction", type=float, default=0.5,
                    help="Centroid threshold as fraction of frame max. "
                         "Default: 0.5.")
@@ -880,6 +934,7 @@ def main(argv: list[str] | None = None) -> int:
         max_iterations=args.max_iterations,
         damping=args.damping,
         divergence_grow_threshold=args.divergence_threshold,
+        max_correction_per_iter_urad=args.max_correction_urad,
         threshold_fraction=args.threshold_fraction,
         camera_pixel_um=args.camera_pixel_um,
         gate_z=args.gate_z,
