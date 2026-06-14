@@ -58,6 +58,7 @@ from ._shared.epics import (
     move_table_axis,
     safe_restore,
 )
+from ._shared.log import setup_console_logger
 
 
 # ---------------------------------------------------------------------------
@@ -921,10 +922,7 @@ def _build_argparser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_argparser().parse_args(argv)
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s  %(levelname)-7s  %(name)s: %(message)s",
-    )
+    setup_console_logger(level=args.log_level)
     config = Config(
         z_near=args.z_near,
         z_far=args.z_far,
