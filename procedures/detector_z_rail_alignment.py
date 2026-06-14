@@ -140,8 +140,10 @@ PRECONDITIONS = [
         "state": "beamline_enabled",
         "description": "Hutches searched + locked; BLEPS clear; APS "
                        "delivering beam; FES permit granted.",
-        "predicate": "TBD (composite: BLEPS status + PSS hutch status "
-                     "+ machine state)",
+        "predicate": "S02BM-PSS:StaA:SecureM == 1 (ON)  AND  "
+                     "S02BM-PSS:StaB:SecureM == 1 (ON)  AND  "
+                     "S02BM-PSS:FES:BeamBlockingM == 0 (OFF)  AND  "
+                     "BLEPS clear (TBD)  AND  APS delivering beam (TBD)",
         "satisfied_by": "enable_beamline",
         "doc": "procedures/item_003.rst",
     },
@@ -229,8 +231,11 @@ PRECONDITIONS = [
     },
     {
         "state": "pss_interlocks_satisfied",
-        "description": "Nobody in 2-BM-B; hutch search complete.",
-        "predicate": "TBD (PSS status)",
+        "description": "Nobody in 2-BM-A or 2-BM-B; hutch searches "
+                       "complete and locked.",
+        "predicate": "S02BM-PSS:StaA:SecureM == 1 (ON)  AND  "
+                     "S02BM-PSS:StaB:SecureM == 1 (ON). Sub-condition of "
+                     "beamline_enabled.",
         "satisfied_by": None,
         "doc": None,
     },
