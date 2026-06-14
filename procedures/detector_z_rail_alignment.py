@@ -161,8 +161,9 @@ PRECONDITIONS = [
         "state": "energy_configured",
         "description": "Mirror M1 + DMM at energy-dependent positions "
                        "per the energy package's lookup tables.",
-        "predicate": "TBD (parameterised by energy; needs energy "
-                     "package lookup)",
+        "predicate": "TBD (parameterised by energy; needs lookup from "
+                     "https://github.com/xray-imaging/energy/blob/main/"
+                     "src/energy/data/energy2bm.json)",
         "satisfied_by": "set_energy_to_preselect",
         "doc": "procedures/item_005.rst",
     },
@@ -171,11 +172,11 @@ PRECONDITIONS = [
         "description": "Diagnostic phosphor flag (2bma:m44, vertical) at "
                        "the position appropriate for the beamline mode: "
                        "0 mm (user) for pink, energy-dependent value from "
-                       "energy_move_flag in energy2bm.json for mono.",
+                       "energy_move_flag for mono.",
         "predicate": "2bma:m44.RBV ~ target_flag_y_mm  (target is mode-"
-                     "and-energy dependent; see "
-                     "energy-decarlof/src/energy/data/energy2bm.json key "
-                     "energy_move_flag for mono; 0 for pink).",
+                     "and-energy dependent; key 'energy_move_flag' in "
+                     "https://github.com/xray-imaging/energy/blob/main/"
+                     "src/energy/data/energy2bm.json for mono; 0 for pink).",
         "satisfied_by": "set_flag_in",
         "doc": "procedures/item_006.rst",
     },

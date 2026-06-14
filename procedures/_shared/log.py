@@ -1,6 +1,6 @@
 """ANSI-coloured console logging for procedures.
 
-Adapted from /Users/decarlo/conda/energy-decarlof/src/energy/log.py.
+Adapted from https://github.com/xray-imaging/energy/blob/main/src/energy/log.py.
 INFO -> green, WARNING -> yellow, ERROR / CRITICAL -> red.
 DEBUG is left uncoloured so the procedure's debug noise doesn't
 swamp the operator's eye.
