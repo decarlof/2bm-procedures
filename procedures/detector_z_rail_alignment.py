@@ -82,22 +82,28 @@ TABLE_JACK_PREFIXES = (
     "2bmb:m14",  # M0Y
 )
 
-# MCTOptics IOC (selectors are operator-set; procedure only reads)
-PV_LENS_SELECTED = "2bm:MCTOptics:LensSelected"
-PV_CAMERA_SELECTED = "2bm:MCTOptics:CameraSelected"
+# MCTOptics IOC (selectors are operator-set; procedure only reads).
+# Use the setpoint (Select) PVs not the readback (Selected) PVs:
+# at this IOC version Selected may not exist, and Selected uses
+# different display strings ("Camera Selected 1") than Select
+# ("Camera 1"). We key by integer enum index (returned by caget
+# without as_string) to be tolerant of either label scheme.
+PV_LENS_SELECT = "2bm:MCTOptics:LensSelect"
+PV_CAMERA_SELECT = "2bm:MCTOptics:CameraSelect"
 
-# Camera prefix derived from MCTOptics CameraSelected enum string
-CAMERA_PREFIXES = {
-    "Camera 1": "2bmSP1:",   # FLIR Oryx 5MP
-    "Camera 2": "2bmSP2:",   # FLIR Oryx 31MP
+# Camera prefix by mbbo enum index (per pvinfo on 2bm:MCTOptics:CameraSelect:
+# STATE 0 = "Camera 1", STATE 1 = "Camera 2").
+CAMERA_PREFIXES_BY_INDEX = {
+    0: "2bmSP1:",   # FLIR Oryx 5MP
+    1: "2bmSP2:",   # FLIR Oryx 31MP
 }
 
-# Lens magnification keyed by MCTOptics LensSelected enum string.
+# Lens magnification by mbbo enum index (STATE 0 = "Lens1", etc.).
 # Update these when the installed objectives change.
-LENS_MAGNIFICATIONS = {
-    "Lens1": 1.1,
-    "Lens2": 5.0,
-    "Lens3": 10.0,
+LENS_MAGNIFICATIONS_BY_INDEX = {
+    0: 1.1,
+    1: 5.0,
+    2: 10.0,
 }
 
 # Z-stage software guard (procedure-level; does not modify motor limits)
@@ -295,33 +301,44 @@ class DetectorZRailAlignment:
     # ---- detection of operator-set camera / lens --------------------------
 
     def detect_camera_and_lens(self) -> None:
-        """Read MCTOptics CameraSelected / LensSelected and derive
-        ``cam_prefix`` + ``magnification``. Operator-set; not modified."""
-        camera = caget(PV_CAMERA_SELECTED, as_string=True)
-        lens = caget(PV_LENS_SELECTED, as_string=True)
-        if camera is None:
+        """Read MCTOptics ``CameraSelect`` / ``LensSelect`` (the setpoint
+        mbbo records) and derive ``cam_prefix`` + ``magnification`` from
+        their enum index. Operator-set; not modified."""
+        cam_idx_raw = caget(PV_CAMERA_SELECT)
+        lens_idx_raw = caget(PV_LENS_SELECT)
+        if cam_idx_raw is None:
             raise RuntimeError(
-                f"could not read {PV_CAMERA_SELECTED} — is MCTOptics IOC "
+                f"could not read {PV_CAMERA_SELECT} -- is MCTOptics IOC "
                 "reachable from this host?"
             )
-        if camera not in CAMERA_PREFIXES:
-            raise RuntimeError(
-                f"unknown camera selection {camera!r}; "
-                f"expected one of {list(CAMERA_PREFIXES)}"
-            )
-        self._cam_prefix = CAMERA_PREFIXES[camera]
+        if lens_idx_raw is None:
+            raise RuntimeError(f"could not read {PV_LENS_SELECT}")
+        cam_idx = int(cam_idx_raw)
+        lens_idx = int(lens_idx_raw)
 
-        if lens is None:
-            raise RuntimeError(f"could not read {PV_LENS_SELECTED}")
-        if lens not in LENS_MAGNIFICATIONS:
-            raise RuntimeError(
-                f"unknown lens selection {lens!r}; "
-                f"expected one of {list(LENS_MAGNIFICATIONS)}"
-            )
-        self._magnification = LENS_MAGNIFICATIONS[lens]
+        # Human labels for logging only (don't gate on string match -- the
+        # IOC may use either "Camera 1" or "Camera Selected 1" depending
+        # on version, and we already have the authoritative index above).
+        cam_label = caget(PV_CAMERA_SELECT, as_string=True) or f"index {cam_idx}"
+        lens_label = caget(PV_LENS_SELECT, as_string=True) or f"index {lens_idx}"
 
-        log.info("detected: camera=%s (%s), lens=%s (%.2fx magnification)",
-                 camera, self._cam_prefix, lens, self._magnification)
+        if cam_idx not in CAMERA_PREFIXES_BY_INDEX:
+            raise RuntimeError(
+                f"unknown camera enum index {cam_idx} ({cam_label!r}); "
+                f"expected one of {sorted(CAMERA_PREFIXES_BY_INDEX)}"
+            )
+        if lens_idx not in LENS_MAGNIFICATIONS_BY_INDEX:
+            raise RuntimeError(
+                f"unknown lens enum index {lens_idx} ({lens_label!r}); "
+                f"expected one of {sorted(LENS_MAGNIFICATIONS_BY_INDEX)}"
+            )
+        self._cam_prefix = CAMERA_PREFIXES_BY_INDEX[cam_idx]
+        self._magnification = LENS_MAGNIFICATIONS_BY_INDEX[lens_idx]
+
+        log.info("detected: camera=%s [idx %d] -> %s, "
+                 "lens=%s [idx %d] -> %.2fx magnification",
+                 cam_label, cam_idx, self._cam_prefix,
+                 lens_label, lens_idx, self._magnification)
 
     # ---- gated motion helpers --------------------------------------------
 
