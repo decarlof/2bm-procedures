@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from epics import caget, caput
 
-from ._shared.centroid import center_of_mass, pixels_to_object_um
+from ._shared.centroid import centroid_above_background, pixels_to_object_um
 from ._shared.cora_log import CoraProcedureLog
 from ._shared.epics import (
     OperatorAbort,
@@ -300,8 +300,15 @@ class Config:
     convergence_threshold_urad: float | None = None
     convergence_safety_margin: float = 1.5
     centroid_noise_pix: float = 1.0
+    # Centroid algorithm tunables (centroid_above_background):
+    # bg_corner_size = pixels per side of each of 4 corner boxes
+    # used to estimate background mean+std. bg_sigma_threshold =
+    # the threshold is bg_mean + N*bg_std; smaller N includes more
+    # of the dim halo (and more noise), larger N keeps only clearly-
+    # above-background pixels.
+    bg_corner_size: int = 100
+    bg_sigma_threshold: float = 5.0
     max_iterations: int = 5
-    threshold_fraction: float = 0.5
     camera_pixel_um: float = 3.45
     # Damping factor on the computed correction (0 < damping <= 1). 0.5
     # halves the move each iteration; safer in the presence of an
@@ -775,11 +782,15 @@ class DetectorZRailAlignment:
         """
         frame = acquire_image(self._cam_prefix,
                               exposure_time=self.config.exposure_time)
-        com = center_of_mass(frame, self.config.threshold_fraction)
-        if com is None:
+        result = centroid_above_background(
+            frame,
+            bg_corner_size=self.config.bg_corner_size,
+            bg_sigma_threshold=self.config.bg_sigma_threshold,
+        )
+        if result is None:
             raise RuntimeError(
-                "centroid fit failed: no signal above "
-                f"threshold_fraction={self.config.threshold_fraction}. "
+                "centroid fit failed: no pixels above background+"
+                f"{self.config.bg_sigma_threshold:.1f}*std. "
                 "Likely upstream-precondition failures (check, in order):\n"
                 "  1. FES shutter open?  caget S02BM-PSS:FES:BeamBlockingM "
                 "(expect OFF)\n"
@@ -795,19 +806,22 @@ class DetectorZRailAlignment:
                 "docs/source/procedures/item_002.rst for the full "
                 "checklist (PRECONDITIONS in this module mirrors it)."
             )
+        px, py, diag = result
         h, w = frame.shape
-        px, py = com
         dx_pix = px - w / 2.0
         dy_pix = py - h / 2.0
         x_um, y_um = pixels_to_object_um(
-            com,
+            (px, py),
             camera_pixel_um=self._pixel_um,   # sensor pitch * binning
             magnification=self._magnification,
         )
         log.info("centroid: pix=(%.1f, %.1f) in %dx%d frame; "
                  "offset-from-centre=(%+.1f, %+.1f) pix; "
-                 "object-um=(%+.2f, %+.2f)",
-                 px, py, w, h, dx_pix, dy_pix, x_um, y_um)
+                 "object-um=(%+.2f, %+.2f); beam=%d pix (%.2f%%), "
+                 "threshold=%.0f (bg_median=%.0f, bg_sigma=%.1f)",
+                 px, py, w, h, dx_pix, dy_pix, x_um, y_um,
+                 diag["n_beam_pix"], 100 * diag["frame_pix_fraction"],
+                 diag["threshold"], diag["bg_median"], diag["bg_sigma"])
         return (x_um, y_um)
 
     # ---- procedure phases ------------------------------------------------
@@ -1282,9 +1296,18 @@ def _build_argparser() -> argparse.ArgumentParser:
                         "calibration point when M-inversion computes a "
                         "large value (which happens when the table has "
                         "weak control authority in one slope direction).")
-    p.add_argument("--threshold-fraction", type=float, default=0.5,
-                   help="Centroid threshold as fraction of frame max. "
-                        "Default: 0.5.")
+    p.add_argument("--bg-corner-size", type=int, default=100,
+                   help="Pixels per side of each of the 4 corner boxes "
+                        "used to estimate the background noise floor for "
+                        "the centroid threshold. Default: 100. Reduce if "
+                        "the spot is large enough to encroach on the "
+                        "frame corners.")
+    p.add_argument("--bg-sigma-threshold", type=float, default=5.0,
+                   help="The centroid binary mask is built by thresholding "
+                        "at bg_mean + N*bg_std. Default: 5.0. Smaller N "
+                        "includes more of the dim halo (and more noise); "
+                        "larger N keeps only clearly-above-background "
+                        "pixels.")
     p.add_argument("--camera-pixel-um", type=float, default=3.45,
                    help="Camera SENSOR pixel pitch (um), pre-binning. "
                         "Procedure multiplies by cam1:BinX_RBV at runtime "
@@ -1328,7 +1351,8 @@ def main(argv: list[str] | None = None) -> int:
         divergence_cumulative_threshold=args.divergence_cumulative_threshold,
         sensitivity_cond_warn_threshold=args.sensitivity_cond_warn_threshold,
         max_correction_per_iter_urad=args.max_correction_urad,
-        threshold_fraction=args.threshold_fraction,
+        bg_corner_size=args.bg_corner_size,
+        bg_sigma_threshold=args.bg_sigma_threshold,
         camera_pixel_um=args.camera_pixel_um,
         gate_z=args.gate_z,
         dry_run=args.dry_run,
