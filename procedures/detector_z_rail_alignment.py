@@ -45,6 +45,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 
+import numpy as np
 from epics import caget, caput
 
 from ._shared.centroid import center_of_mass, pixels_to_object_um
@@ -128,7 +129,24 @@ class Config:
     max_iterations: int = 5
     threshold_fraction: float = 0.5
     camera_pixel_um: float = 3.45
-    min_jacobian_um_per_urad: float = 0.001
+    # Damping factor on the computed correction (0 < damping <= 1). 0.5
+    # halves the move each iteration; safer in the presence of an
+    # imperfect sensitivity matrix or table cross-coupling beyond what
+    # a 2x2 linear model captures.
+    damping: float = 0.5
+    # Abort if |slope| grows by more than this factor from one iter
+    # to the next -- protection against runaway divergence.
+    divergence_grow_threshold: float = 1.5
+    # If True, prompt y/N before each Z measurement move. If False
+    # (default), Z measurement moves are announced but not gated --
+    # they stay within the [Z_GUARD_MIN, Z_GUARD_MAX] band and don't
+    # change the alignment, only sample it. Table moves are ALWAYS
+    # gated regardless of this flag.
+    gate_z: bool = False
+    # Minimum |det(M)| where M is the 2x2 slope-sensitivity matrix
+    # (units: (um/mm)^2 / urad^2). Below this M is treated as
+    # near-singular and calibration aborts with a clear message.
+    min_sensitivity_det: float = 1.0e-6
     dry_run: bool = False
     auto_yes: bool = False
     confirm_restore: bool = False
@@ -136,12 +154,35 @@ class Config:
 
 
 @dataclass
-class Jacobian:
-    """Table -> centroid sensitivity at z_far (units: um centroid / urad table)."""
-    J_AY_X: float = 0.0
-    J_AY_Y: float = 0.0
-    J_AX_X: float = 0.0
-    J_AX_Y: float = 0.0
+class Sensitivity:
+    """2x2 slope-per-axis sensitivity matrix M built by calibrate_sensitivity().
+
+    Defines how table tilts affect the **slope** of centroid drift vs Z
+    (the quantity the procedure is trying to drive to zero):
+
+        Δslope_X (um/mm) = M_AY_X * ΔAY (urad)  +  M_AX_X * ΔAX (urad)
+        Δslope_Y (um/mm) = M_AY_Y * ΔAY (urad)  +  M_AX_Y * ΔAX (urad)
+
+    Diagonal terms (M_AY_X, M_AX_Y) capture the principal effect of
+    each table axis on the slope it primarily controls; off-diagonal
+    terms (M_AY_Y, M_AX_X) capture cross-coupling between the two
+    table axes and the centroid axes (which is significant on this
+    table -- the previous diagonal-only correction diverged).
+
+    Iteration solves M @ (ΔAY, ΔAX) = -(slope_X, slope_Y) for the
+    correction (which is then damped by config.damping).
+    """
+    M_AY_X: float = 0.0
+    M_AY_Y: float = 0.0
+    M_AX_X: float = 0.0
+    M_AX_Y: float = 0.0
+
+    def as_matrix(self) -> np.ndarray:
+        return np.array([[self.M_AY_X, self.M_AX_X],
+                         [self.M_AY_Y, self.M_AX_Y]])
+
+    def determinant(self) -> float:
+        return self.M_AY_X * self.M_AX_Y - self.M_AX_X * self.M_AY_Y
 
 
 @dataclass
@@ -314,7 +355,7 @@ class DetectorZRailAlignment:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.baseline = Baseline()
-        self.jacobian = Jacobian()
+        self.sensitivity = Sensitivity()
         self.history: list[IterationResult] = []
         self._snapshot: _Snapshot | None = None
         self._cam_prefix: str = ""
@@ -396,16 +437,22 @@ class DetectorZRailAlignment:
         )
 
     def _gated_move_z(self, target: float, step_label: str) -> None:
+        """Move Z. By default Z moves are announced but NOT gated --
+        they stay within the safety band and don't change the
+        alignment, only sample it. Set ``--gate-z`` for full gating."""
         if not (Z_GUARD_MIN_MM <= target <= Z_GUARD_MAX_MM):
             raise ValueError(
                 f"Z target {target} mm outside safety band "
                 f"[{Z_GUARD_MIN_MM}, {Z_GUARD_MAX_MM}]"
             )
         current = float(caget(f"{PV_OP_Z_MOTOR}.RBV"))
-        proceed = self._gate(
+        proceed = confirm_motion(
             [{"pv": PV_OP_Z_MOTOR, "current": current,
               "target": target, "units": "mm"}],
             step_label=step_label,
+            dry_run=self.config.dry_run,
+            auto_yes=self.config.auto_yes,
+            announce_only=not self.config.gate_z,
         )
         if proceed:
             move_motor(PV_OP_Z_MOTOR, target, timeout=180)
@@ -485,87 +532,154 @@ class DetectorZRailAlignment:
         log.info("baseline table AY=%.6g, AX=%.6g (deg)",
                  self.baseline.table_AY, self.baseline.table_AX)
 
-    def calibrate_jacobian(self) -> None:
-        c = self.config
-        delta = c.z_calibration_step_urad * 1e-3 / 17.4533  # urad -> deg
-        # 1 urad = 1e-6 rad = 5.7296e-5 deg; using shorter constant for clarity:
-        delta = c.z_calibration_step_urad * 5.72958e-5
-
-        log.info("calibrate Jacobian at z_far=%.3f mm with delta=%.1f urad "
-                 "(%.3e deg)", c.z_far, c.z_calibration_step_urad, delta)
-
-        self._gated_move_z(c.z_far, "step: move Z to far for Jacobian calibration")
-        x_f0, y_f0 = self._measure_centroid()
-
-        # AY perturbation
-        self._gated_move_table(
-            PV_TABLE_AY, self.baseline.table_AY + delta,
-            f"calibration: perturb AY by +{c.z_calibration_step_urad:.1f} urad",
-        )
-        x_f1, y_f1 = self._measure_centroid()
-        self.jacobian.J_AY_X = (x_f1 - x_f0) / c.z_calibration_step_urad
-        self.jacobian.J_AY_Y = (y_f1 - y_f0) / c.z_calibration_step_urad
-        log.info("  J_AY_X=%+.4f, J_AY_Y=%+.4f um/urad",
-                 self.jacobian.J_AY_X, self.jacobian.J_AY_Y)
-        self._gated_move_table(
-            PV_TABLE_AY, self.baseline.table_AY,
-            "calibration: restore AY",
-        )
-
-        # AX perturbation
-        self._gated_move_table(
-            PV_TABLE_AX, self.baseline.table_AX + delta,
-            f"calibration: perturb AX by +{c.z_calibration_step_urad:.1f} urad",
-        )
-        x_f2, y_f2 = self._measure_centroid()
-        self.jacobian.J_AX_X = (x_f2 - x_f0) / c.z_calibration_step_urad
-        self.jacobian.J_AX_Y = (y_f2 - y_f0) / c.z_calibration_step_urad
-        log.info("  J_AX_X=%+.4f, J_AX_Y=%+.4f um/urad",
-                 self.jacobian.J_AX_X, self.jacobian.J_AX_Y)
-        self._gated_move_table(
-            PV_TABLE_AX, self.baseline.table_AX,
-            "calibration: restore AX",
-        )
-
-        # Sanity-floor check would always trip in dry-run (centroids are
-        # stubbed to (0,0), so every Jacobian element is exactly zero).
-        # Skip it -- the whole point of dry-run is to walk the steps.
-        if not c.dry_run and (
-                abs(self.jacobian.J_AY_X) < c.min_jacobian_um_per_urad
-                or abs(self.jacobian.J_AX_Y) < c.min_jacobian_um_per_urad):
-            raise RuntimeError(
-                f"Jacobian below sanity floor "
-                f"(|J_AY_X|={abs(self.jacobian.J_AY_X):.5f}, "
-                f"|J_AX_Y|={abs(self.jacobian.J_AX_Y):.5f}); "
-                "test step too small, slits closed, or table not moving?"
-            )
-
     def _measure_slope(self) -> tuple[float, float, float, float, float, float]:
-        self._gated_move_z(self.config.z_near,
-                           "iteration: move Z to near for slope measurement")
+        """Move Z to z_near, acquire; move Z to z_far, acquire.
+
+        Returns ``(x_n, y_n, x_f, y_f, slope_X, slope_Y)`` where the
+        slopes are in object-side micrometres per mm of Z travel.
+        """
+        self._gated_move_z(self.config.z_near, "measure slope: Z to near")
         x_n, y_n = self._measure_centroid()
-        self._gated_move_z(self.config.z_far,
-                           "iteration: move Z to far for slope measurement")
+        self._gated_move_z(self.config.z_far, "measure slope: Z to far")
         x_f, y_f = self._measure_centroid()
         dz = self.config.z_far - self.config.z_near
         return x_n, y_n, x_f, y_f, (x_f - x_n) / dz, (y_f - y_n) / dz
 
-    def iterate(self) -> bool:
-        c = self.config
-        log.info("iterate (max_iterations=%d, threshold=%.1f urad)",
-                 c.max_iterations, c.convergence_threshold_urad)
+    def calibrate_sensitivity(self) -> None:
+        """Build the 2x2 slope-sensitivity matrix M.
 
-        sign_AY = math.copysign(1.0, self.jacobian.J_AY_X)
-        sign_AX = math.copysign(1.0, self.jacobian.J_AX_Y)
+        For each of (AY, AX): measure baseline slope (Z near + Z far),
+        perturb the axis by ``z_calibration_step_urad``, re-measure
+        slope, restore. The diagonals tell us how each axis affects
+        the slope it primarily controls; the off-diagonals capture
+        cross-coupling.
+
+        This is the right physical quantity for the iteration step.
+        The previous design measured centroid-shift-at-z-far per
+        axis-urad ("Jacobian"), which is geometry-dependent and does
+        NOT directly drive slope correction (uniform centroid shifts
+        cancel between z_near and z_far and leave slope unchanged).
+        """
+        c = self.config
+        delta_urad = c.z_calibration_step_urad
+        delta_deg = delta_urad * 5.72958e-5
+
+        log.info("calibrate sensitivity matrix at z=[%.0f, %.0f] mm "
+                 "with delta=%.1f urad (%.3e deg)",
+                 c.z_near, c.z_far, delta_urad, delta_deg)
+
+        # Baseline slope
+        log.info("calibrate: measure baseline slope")
+        _, _, _, _, slope0_X, slope0_Y = self._measure_slope()
+        log.info("  baseline: slope_X=%+.4f um/mm (tilt %+.1f urad), "
+                 "slope_Y=%+.4f um/mm (tilt %+.1f urad)",
+                 slope0_X, slope0_X * 1000.0,
+                 slope0_Y, slope0_Y * 1000.0)
+
+        # AY perturb + re-measure
+        self._gated_move_table(
+            PV_TABLE_AY, self.baseline.table_AY + delta_deg,
+            f"calibration: perturb AY by +{delta_urad:.1f} urad")
+        log.info("calibrate: measure slope with AY perturbed")
+        _, _, _, _, slope_AY_X, slope_AY_Y = self._measure_slope()
+        log.info("  AY-perturbed: slope_X=%+.4f, slope_Y=%+.4f um/mm",
+                 slope_AY_X, slope_AY_Y)
+        self._gated_move_table(
+            PV_TABLE_AY, self.baseline.table_AY,
+            "calibration: restore AY")
+
+        # AX perturb + re-measure
+        self._gated_move_table(
+            PV_TABLE_AX, self.baseline.table_AX + delta_deg,
+            f"calibration: perturb AX by +{delta_urad:.1f} urad")
+        log.info("calibrate: measure slope with AX perturbed")
+        _, _, _, _, slope_AX_X, slope_AX_Y = self._measure_slope()
+        log.info("  AX-perturbed: slope_X=%+.4f, slope_Y=%+.4f um/mm",
+                 slope_AX_X, slope_AX_Y)
+        self._gated_move_table(
+            PV_TABLE_AX, self.baseline.table_AX,
+            "calibration: restore AX")
+
+        # Build M: rows = (slope_X, slope_Y), cols = (AY, AX)
+        self.sensitivity = Sensitivity(
+            M_AY_X=(slope_AY_X - slope0_X) / delta_urad,
+            M_AY_Y=(slope_AY_Y - slope0_Y) / delta_urad,
+            M_AX_X=(slope_AX_X - slope0_X) / delta_urad,
+            M_AX_Y=(slope_AX_Y - slope0_Y) / delta_urad,
+        )
+        M = self.sensitivity
+        det = M.determinant()
+        log.info("sensitivity matrix M (um/mm of slope per urad of axis):")
+        log.info("  d_slope_X = %+.6f * dAY + %+.6f * dAX",
+                 M.M_AY_X, M.M_AX_X)
+        log.info("  d_slope_Y = %+.6f * dAY + %+.6f * dAX",
+                 M.M_AY_Y, M.M_AX_Y)
+        log.info("  det(M) = %+.4e", det)
+
+        # Sanity check: M not near-singular. Skip in dry-run (centroids
+        # are real but Z/table didn't move, so all measurements are at
+        # the same physical state -> matrix is exactly zero).
+        if not c.dry_run and abs(det) < c.min_sensitivity_det:
+            raise RuntimeError(
+                f"sensitivity matrix near-singular "
+                f"(|det|={abs(det):.4e} < min={c.min_sensitivity_det:.4e}). "
+                f"Likely causes: calibration step ({delta_urad} urad) too "
+                "small for the centroid noise floor, slits over-closed, "
+                "or table AY and AX have near-parallel slope effects. "
+                "Try --calibration-step-urad 100."
+            )
+
+    def iterate(self) -> bool:
+        """Iterative correction using M_inv @ -slope, with damping
+        and a divergence guard.
+
+        ΔAY, ΔAX (urad) such that
+            M @ (ΔAY, ΔAX) = -(slope_X, slope_Y)
+        nominally drives the slope to zero. With table cross-coupling
+        and finite calibration accuracy, a damping factor < 1 keeps
+        us in the linear range across iterations. If |slope| grows
+        from one iter to the next by more than ``divergence_grow_threshold``,
+        we abort -- the restore path puts table AY/AX back to baseline.
+        """
+        c = self.config
+        log.info("iterate (max_iterations=%d, threshold=%.1f urad, "
+                 "damping=%.2f, divergence_grow_threshold=%.2fx)",
+                 c.max_iterations, c.convergence_threshold_urad,
+                 c.damping, c.divergence_grow_threshold)
+
         deg_per_urad = 5.72958e-5
+        M = self.sensitivity.as_matrix()
+        try:
+            M_inv = np.linalg.inv(M)
+        except np.linalg.LinAlgError as exc:
+            raise RuntimeError(f"sensitivity matrix not invertible: {exc} "
+                               "(re-calibrate with larger step)") from exc
+
+        prev_slope_mag = None
 
         for i in range(1, c.max_iterations + 1):
             x_n, y_n, x_f, y_f, slope_X, slope_Y = self._measure_slope()
-            tilt_X_urad = slope_X * 1000.0
-            tilt_Y_urad = slope_Y * 1000.0
+            tilt_X = slope_X * 1000.0
+            tilt_Y = slope_Y * 1000.0
+            slope_mag = math.hypot(tilt_X, tilt_Y)
 
-            converged = (abs(tilt_X_urad) <= c.convergence_threshold_urad
-                         and abs(tilt_Y_urad) <= c.convergence_threshold_urad)
+            # Divergence guard
+            if (prev_slope_mag is not None and
+                    slope_mag > prev_slope_mag * c.divergence_grow_threshold and
+                    not c.dry_run):
+                log.error("DIVERGING at iter %d: |slope| grew from %.1f to "
+                          "%.1f urad", i, prev_slope_mag, slope_mag)
+                raise RuntimeError(
+                    f"divergence at iter {i}: |slope|={slope_mag:.1f} urad "
+                    f"exceeds previous {prev_slope_mag:.1f} urad by "
+                    f">{c.divergence_grow_threshold:.1f}x. Sensitivity "
+                    "matrix is inaccurate; re-calibrate with larger "
+                    "--calibration-step-urad."
+                )
+            prev_slope_mag = slope_mag
+
+            converged = (abs(tilt_X) <= c.convergence_threshold_urad
+                         and abs(tilt_Y) <= c.convergence_threshold_urad)
 
             result = IterationResult(
                 iteration=i,
@@ -573,34 +687,36 @@ class DetectorZRailAlignment:
                 X_far_um=x_f, Y_far_um=y_f,
                 slope_X_um_per_mm=slope_X,
                 slope_Y_um_per_mm=slope_Y,
-                tilt_X_urad=tilt_X_urad,
-                tilt_Y_urad=tilt_Y_urad,
+                tilt_X_urad=tilt_X,
+                tilt_Y_urad=tilt_Y,
                 converged=converged,
             )
 
             if converged:
                 self.history.append(result)
-                log.info("  iter %d: CONVERGED  tilt_X=%.2f urad, tilt_Y=%.2f urad",
-                         i, tilt_X_urad, tilt_Y_urad)
+                log.info("  iter %d: CONVERGED  tilt_X=%.2f urad, "
+                         "tilt_Y=%.2f urad", i, tilt_X, tilt_Y)
                 return True
 
-            d_AY = -sign_AY * tilt_X_urad
-            d_AX = -sign_AX * tilt_Y_urad
+            # Solve M @ d = -slope for d = (dAY, dAX) in urad; damp.
+            d = M_inv @ np.array([-slope_X, -slope_Y])
+            d_AY = float(d[0]) * c.damping
+            d_AX = float(d[1]) * c.damping
             result.correction_AY_urad = d_AY
             result.correction_AX_urad = d_AX
             self.history.append(result)
-            log.info("  iter %d: tilt_X=%+.2f urad -> dAY=%+.2f urad; "
-                     "tilt_Y=%+.2f urad -> dAX=%+.2f urad",
-                     i, tilt_X_urad, d_AY, tilt_Y_urad, d_AX)
+            log.info("  iter %d: tilt_X=%+.2f, tilt_Y=%+.2f urad -> "
+                     "dAY=%+.2f urad, dAX=%+.2f urad (damped %.2fx)",
+                     i, tilt_X, tilt_Y, d_AY, d_AX, c.damping)
 
             new_AY = float(caget(PV_TABLE_AY)) + d_AY * deg_per_urad
             new_AX = float(caget(PV_TABLE_AX)) + d_AX * deg_per_urad
             self._gated_move_table_pair(
                 new_AY, new_AX,
-                f"iteration {i}: apply corrective table tilt",
-            )
+                f"iteration {i}: apply corrective table tilt")
 
-        log.warning("did not converge after %d iterations", c.max_iterations)
+        log.warning("did not converge after %d iterations",
+                    c.max_iterations)
         return False
 
     # ---- orchestrator ----------------------------------------------------
@@ -637,9 +753,9 @@ class DetectorZRailAlignment:
             self.record_baseline()
             if cora:
                 cora.append_step("baseline", vars(self.baseline))
-            self.calibrate_jacobian()
+            self.calibrate_sensitivity()
             if cora:
-                cora.append_step("calibrate", vars(self.jacobian))
+                cora.append_step("calibrate", vars(self.sensitivity))
             converged = self.iterate()
             if cora:
                 cora.append_step("iterate",
@@ -703,14 +819,23 @@ def _build_argparser() -> argparse.ArgumentParser:
                         f"Must be in [{Z_GUARD_MIN_MM}, {Z_GUARD_MAX_MM}]. "
                         f"Default: 500.")
     p.add_argument("--calibration-step-urad", type=float, default=50.0,
-                   help="Test step applied to table AY/AX for Jacobian "
-                        "discovery. Default: 50 urad.")
+                   help="Test step applied to table AY/AX for sensitivity "
+                        "matrix discovery. Default: 50 urad. If calibration "
+                        "fails with a near-singular determinant, try 100.")
     p.add_argument("--exposure-time", type=float, default=0.05,
                    help="Camera exposure (s). Default: 0.05.")
     p.add_argument("--convergence-urad", type=float, default=5.0,
                    help="Stop iterating when |tilt_X|, |tilt_Y| are below "
                         "this. Default: 5 urad.")
     p.add_argument("--max-iterations", type=int, default=5)
+    p.add_argument("--damping", type=float, default=0.5,
+                   help="Damping factor 0 < d <= 1 on the computed iteration "
+                        "correction. 1.0 = full correction, 0.5 = half. "
+                        "Default: 0.5 (safer in the presence of imperfect "
+                        "sensitivity matrix or beyond-linear coupling).")
+    p.add_argument("--divergence-threshold", type=float, default=1.5,
+                   help="Abort if |slope| grows by more than this factor "
+                        "from one iteration to the next. Default: 1.5.")
     p.add_argument("--threshold-fraction", type=float, default=0.5,
                    help="Centroid threshold as fraction of frame max. "
                         "Default: 0.5.")
@@ -719,6 +844,11 @@ def _build_argparser() -> argparse.ArgumentParser:
                         "Procedure multiplies by cam1:BinX_RBV at runtime "
                         "to get the effective pixel pitch of the delivered "
                         "image. Default: 3.45 (both Oryx 5MP and 31MP).")
+    p.add_argument("--gate-z", action="store_true",
+                   help="Also gate Z measurement moves on y/N. Default off: "
+                        "Z moves stay within the safety band and only sample "
+                        "alignment, so they're announced but not gated. "
+                        "Table moves are ALWAYS gated regardless.")
     p.add_argument("--yes", action="store_true",
                    help="Auto-confirm every motion prompt (skip y/N gate). "
                         "Use for headless or scripted runs.")
@@ -748,8 +878,11 @@ def main(argv: list[str] | None = None) -> int:
         exposure_time=args.exposure_time,
         convergence_threshold_urad=args.convergence_urad,
         max_iterations=args.max_iterations,
+        damping=args.damping,
+        divergence_grow_threshold=args.divergence_threshold,
         threshold_fraction=args.threshold_fraction,
         camera_pixel_um=args.camera_pixel_um,
+        gate_z=args.gate_z,
         dry_run=args.dry_run,
         auto_yes=args.yes,
         confirm_restore=args.confirm_restore,
