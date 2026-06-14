@@ -113,6 +113,130 @@ Z_GUARD_MIN_MM = 200.0
 Z_GUARD_MAX_MM = 500.0
 
 
+# ---------------------------------------------------------------------------
+# Preconditions (Layer 2: machine-readable form of the doc table).
+#
+# Data ONLY -- not exercised at runtime in v0.0.1. The procedure relies on
+# the operator to establish each of these before launching. The single
+# implicit runtime check is in `_measure_centroid`: if no signal is found
+# above threshold, the error message points back to this list.
+#
+# Cora can ingest the list once the schema lands. The fields:
+#   state:        unique identifier; matches the State column in the
+#                 item_002.rst Preconditions table.
+#   description:  free-text human description.
+#   predicate:    informal expression of the test; not a callable today.
+#                 Includes the PV name(s) where one is known, "TBD" when
+#                 the satisfying procedure is itself a stub, or a free-text
+#                 description when the predicate spans multiple PVs.
+#   satisfied_by: procedure name (the cora Method.name) that establishes
+#                 the state.
+#   doc:          path to the satisfying procedure's spec doc (relative to
+#                 the 2bm-docs docs/source root).
+# ---------------------------------------------------------------------------
+
+PRECONDITIONS = [
+    {
+        "state": "beamline_enabled",
+        "description": "Hutches searched + locked; BLEPS clear; APS "
+                       "delivering beam; FES permit granted.",
+        "predicate": "TBD (composite: BLEPS status + PSS hutch status "
+                     "+ machine state)",
+        "satisfied_by": "enable_beamline",
+        "doc": "procedures/item_003.rst",
+    },
+    {
+        "state": "a_slits_open",
+        "description": "A-station slits open enough that propagation "
+                       "produces ~1x1 mm at sample / detector.",
+        "predicate": "A-station Slit H size RBV >= 0.5 mm AND "
+                     "Slit V size RBV >= 0.5 mm (PVs TBD; see item_020)",
+        "satisfied_by": "set_a_slits",
+        "doc": "procedures/item_004.rst",
+    },
+    {
+        "state": "energy_configured",
+        "description": "Mirror M1 + DMM at energy-dependent positions "
+                       "per the energy package's lookup tables.",
+        "predicate": "TBD (parameterised by energy; needs energy "
+                     "package lookup)",
+        "satisfied_by": "set_energy_to_preselect",
+        "doc": "procedures/item_005.rst",
+    },
+    {
+        "state": "flag_in_beam",
+        "description": "Flag (future hardware) at in-beam Y position.",
+        "predicate": "TBD (flag not yet in hardware inventory)",
+        "satisfied_by": "set_flag_in",
+        "doc": "procedures/item_006.rst",
+    },
+    {
+        "state": "b_shutter_open",
+        "description": "P6-50 safety shutter open (beam reaches 2-BM-B).",
+        "predicate": "S02BM-PSS:SBS:BeamBlockingM == 0  "
+                     "(STATE 0 OFF = NOT blocking = OPEN; inverted enum)",
+        "satisfied_by": "open_b_shutter",
+        "doc": "procedures/item_007.rst",
+    },
+    {
+        "state": "b_slits_configured",
+        "description": "B-station slits at 1.0x1.0 mm centred on the "
+                       "energy-set vertical Y.",
+        "predicate": "(2bma:m12.RBV - 2bma:m11.RBV) ~ 1.0 mm  AND  "
+                     "(2bma:m9.RBV - 2bma:m10.RBV) ~ 1.0 mm  AND  "
+                     "(2bma:m9.RBV + 2bma:m10.RBV)/2 ~ y_for_energy(E)",
+        "satisfied_by": "set_b_slits",
+        "doc": "procedures/item_008.rst",
+    },
+    {
+        "state": "sample_out_of_beam",
+        "description": "Relevant sample-stack axis (mount-dependent) "
+                       "at its out-of-beam position.",
+        "predicate": "TBD (axis depends on current sample mount)",
+        "satisfied_by": "move_sample_out_of_beam",
+        "doc": "procedures/item_009.rst",
+    },
+    {
+        "state": "microscope_configured",
+        "description": "MCTOptics lens at 1.1x (slot 0); detector table "
+                       "Y at beam centre; Z stage in mid-band.",
+        "predicate": "2bm:MCTOptics:LensSelect == 0  AND  "
+                     "2bmb:table3.Y ~ y_for_energy(E)  AND  "
+                     "200 <= 2bmbAERO:m1.RBV <= 500",
+        "satisfied_by": "configure_microscope_for_alignment",
+        "doc": "procedures/item_010.rst",
+    },
+    # Below: preconditions the procedure relies on but does not have a
+    # dedicated satisfying procedure for. Documented here so cora's
+    # dependency graph is complete; operator (or another procedure) is
+    # responsible.
+    {
+        "state": "fes_shutter_open",
+        "description": "Front-end shutter open (sub-precondition of "
+                       "beamline_enabled, called out separately).",
+        "predicate": "S02BM-PSS:FES:BeamBlockingM == 0  (OPEN)",
+        "satisfied_by": "enable_beamline",  # bundled
+        "doc": "procedures/item_003.rst",
+    },
+    {
+        "state": "mctoptics_ioc_reachable",
+        "description": "2bm:MCTOptics IOC running and reachable from the "
+                       "host running the procedure (the IOC lives on "
+                       "tomdet.xray.aps.anl.gov).",
+        "predicate": "caget(2bm:MCTOptics:CameraSelect) succeeds",
+        "satisfied_by": None,
+        "doc": None,
+    },
+    {
+        "state": "pss_interlocks_satisfied",
+        "description": "Nobody in 2-BM-B; hutch search complete.",
+        "predicate": "TBD (PSS status)",
+        "satisfied_by": None,
+        "doc": None,
+    },
+]
+
+
 log = logging.getLogger(__name__)
 
 
@@ -516,8 +640,22 @@ class DetectorZRailAlignment:
         com = center_of_mass(frame, self.config.threshold_fraction)
         if com is None:
             raise RuntimeError(
-                "centroid fit failed: no signal above threshold "
-                "(slits too closed, beam off, shutter shut?)"
+                "centroid fit failed: no signal above "
+                f"threshold_fraction={self.config.threshold_fraction}. "
+                "Likely upstream-precondition failures (check, in order):\n"
+                "  1. FES shutter open?  caget S02BM-PSS:FES:BeamBlockingM "
+                "(expect OFF)\n"
+                "  2. B-shutter open?    caget S02BM-PSS:SBS:BeamBlockingM "
+                "(expect OFF)\n"
+                "  3. Beam on / DMM at energy? (visible spot on live "
+                "view?)\n"
+                "  4. B-station slits open ~1x1 mm?  caget 2bma:m9 m10 m11 "
+                "m12\n"
+                "  5. Sample out of beam path?\n"
+                "  6. Optique Peter at the right Z and table Y?\n"
+                "See the Preconditions section of "
+                "docs/source/procedures/item_002.rst for the full "
+                "checklist (PRECONDITIONS in this module mirrors it)."
             )
         h, w = frame.shape
         px, py = com
