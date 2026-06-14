@@ -48,7 +48,11 @@ from dataclasses import dataclass, field
 import numpy as np
 from epics import caget, caput
 
-from ._shared.centroid import centroid_above_background, pixels_to_object_um
+from ._shared.centroid import (
+    center_of_mass,
+    centroid_above_background,
+    pixels_to_object_um,
+)
 from ._shared.cora_log import CoraProcedureLog
 from ._shared.epics import (
     OperatorAbort,
@@ -300,14 +304,22 @@ class Config:
     convergence_threshold_urad: float | None = None
     convergence_safety_margin: float = 1.5
     centroid_noise_pix: float = 1.0
-    # Centroid algorithm tunables (centroid_above_background):
-    # bg_corner_size = pixels per side of each of 4 corner boxes
-    # used to estimate background mean+std. bg_sigma_threshold =
-    # the threshold is bg_mean + N*bg_std; smaller N includes more
-    # of the dim halo (and more noise), larger N keeps only clearly-
-    # above-background pixels.
-    bg_corner_size: int = 100
-    bg_sigma_threshold: float = 5.0
+    # Centroid algorithm selector. Two implementations live in
+    # _shared/centroid.py:
+    # - "com": intensity-weighted COM above threshold_fraction * max.
+    #   Empirically more accurate on 2-BM-B DMM images where the
+    #   saturated pixels of the beam are at/inside the actual spot.
+    # - "binmask": geometric centroid of pixels above bg_median +
+    #   bg_sigma_threshold * MAD. More robust IN PRINCIPLE to bright
+    #   features outside the spot, but picks up the multilayer halo
+    #   in this beamline's images and pulls the centroid off-axis.
+    # Tested 2026-06-14 on a 2bmSP2 frame against an operator's hand
+    # measurement of the visual centre: COM 8 px off, binmask 30-40
+    # px off. COM is the default.
+    centroid_algorithm: str = "com"
+    threshold_fraction: float = 0.5            # used by "com"
+    bg_corner_size: int = 100                  # used by "binmask"
+    bg_sigma_threshold: float = 5.0            # used by "binmask"
     max_iterations: int = 5
     camera_pixel_um: float = 3.45
     # Damping factor on the computed correction (0 < damping <= 1). 0.5
@@ -782,31 +794,33 @@ class DetectorZRailAlignment:
         """
         frame = acquire_image(self._cam_prefix,
                               exposure_time=self.config.exposure_time)
-        result = centroid_above_background(
-            frame,
-            bg_corner_size=self.config.bg_corner_size,
-            bg_sigma_threshold=self.config.bg_sigma_threshold,
-        )
-        if result is None:
-            raise RuntimeError(
-                "centroid fit failed: no pixels above background+"
-                f"{self.config.bg_sigma_threshold:.1f}*std. "
-                "Likely upstream-precondition failures (check, in order):\n"
-                "  1. FES shutter open?  caget S02BM-PSS:FES:BeamBlockingM "
-                "(expect OFF)\n"
-                "  2. B-shutter open?    caget S02BM-PSS:SBS:BeamBlockingM "
-                "(expect OFF)\n"
-                "  3. Beam on / DMM at energy? (visible spot on live "
-                "view?)\n"
-                "  4. B-station slits open ~1x1 mm?  caget 2bma:m9 m10 m11 "
-                "m12\n"
-                "  5. Sample out of beam path?\n"
-                "  6. Optique Peter at the right Z and table Y?\n"
-                "See the Preconditions section of "
-                "docs/source/procedures/item_002.rst for the full "
-                "checklist (PRECONDITIONS in this module mirrors it)."
+        algo = self.config.centroid_algorithm
+        diag: dict | None = None
+
+        if algo == "com":
+            com = center_of_mass(frame, self.config.threshold_fraction)
+            if com is None:
+                raise RuntimeError(self._centroid_failure_message(
+                    "no pixels above "
+                    f"threshold_fraction={self.config.threshold_fraction} "
+                    "of frame max"))
+            px, py = com
+        elif algo == "binmask":
+            result = centroid_above_background(
+                frame,
+                bg_corner_size=self.config.bg_corner_size,
+                bg_sigma_threshold=self.config.bg_sigma_threshold,
             )
-        px, py, diag = result
+            if result is None:
+                raise RuntimeError(self._centroid_failure_message(
+                    "no pixels above background+"
+                    f"{self.config.bg_sigma_threshold:.1f}*sigma"))
+            px, py, diag = result
+        else:
+            raise ValueError(
+                f"unknown centroid_algorithm {algo!r}; "
+                "expected 'com' or 'binmask'")
+
         h, w = frame.shape
         dx_pix = px - w / 2.0
         dy_pix = py - h / 2.0
@@ -815,14 +829,39 @@ class DetectorZRailAlignment:
             camera_pixel_um=self._pixel_um,   # sensor pitch * binning
             magnification=self._magnification,
         )
-        log.info("centroid: pix=(%.1f, %.1f) in %dx%d frame; "
-                 "offset-from-centre=(%+.1f, %+.1f) pix; "
-                 "object-um=(%+.2f, %+.2f); beam=%d pix (%.2f%%), "
-                 "threshold=%.0f (bg_median=%.0f, bg_sigma=%.1f)",
-                 px, py, w, h, dx_pix, dy_pix, x_um, y_um,
-                 diag["n_beam_pix"], 100 * diag["frame_pix_fraction"],
-                 diag["threshold"], diag["bg_median"], diag["bg_sigma"])
+        if diag is not None:
+            log.info("centroid[%s]: pix=(%.1f, %.1f) in %dx%d frame; "
+                     "offset-from-centre=(%+.1f, %+.1f) pix; "
+                     "object-um=(%+.2f, %+.2f); beam=%d pix (%.2f%%), "
+                     "threshold=%.0f (bg_median=%.0f, bg_sigma=%.1f)",
+                     algo, px, py, w, h, dx_pix, dy_pix, x_um, y_um,
+                     diag["n_beam_pix"], 100 * diag["frame_pix_fraction"],
+                     diag["threshold"], diag["bg_median"], diag["bg_sigma"])
+        else:
+            log.info("centroid[%s]: pix=(%.1f, %.1f) in %dx%d frame; "
+                     "offset-from-centre=(%+.1f, %+.1f) pix; "
+                     "object-um=(%+.2f, %+.2f)",
+                     algo, px, py, w, h, dx_pix, dy_pix, x_um, y_um)
         return (x_um, y_um)
+
+    def _centroid_failure_message(self, reason: str) -> str:
+        return (
+            f"centroid fit failed: {reason}. "
+            "Likely upstream-precondition failures (check, in order):\n"
+            "  1. FES shutter open?  caget S02BM-PSS:FES:BeamBlockingM "
+            "(expect OFF)\n"
+            "  2. B-shutter open?    caget S02BM-PSS:SBS:BeamBlockingM "
+            "(expect OFF)\n"
+            "  3. Beam on / DMM at energy? (visible spot on live "
+            "view?)\n"
+            "  4. B-station slits open ~1x1 mm?  caget 2bma:m9 m10 m11 "
+            "m12\n"
+            "  5. Sample out of beam path?\n"
+            "  6. Optique Peter at the right Z and table Y?\n"
+            "See the Preconditions section of "
+            "docs/source/procedures/item_002.rst for the full "
+            "checklist (PRECONDITIONS in this module mirrors it)."
+        )
 
     # ---- procedure phases ------------------------------------------------
 
@@ -1296,18 +1335,27 @@ def _build_argparser() -> argparse.ArgumentParser:
                         "calibration point when M-inversion computes a "
                         "large value (which happens when the table has "
                         "weak control authority in one slope direction).")
+    p.add_argument("--centroid-algorithm", choices=["com", "binmask"],
+                   default="com",
+                   help="Centroid algorithm. 'com' = intensity-weighted "
+                        "centre of mass above threshold_fraction * max "
+                        "(default, empirically most accurate on 2-BM-B "
+                        "DMM frames -- ~8 px from operator-eyeballed "
+                        "centre on test image). 'binmask' = geometric "
+                        "centroid above bg_median + N*sigma (more robust "
+                        "IN PRINCIPLE to bright off-spot features, but "
+                        "this beamline's multilayer halo extends off-axis "
+                        "and pulls the centroid ~30 px off in X).")
+    p.add_argument("--threshold-fraction", type=float, default=0.5,
+                   help="(com algorithm only) Centroid threshold as a "
+                        "fraction of frame max. Default: 0.5.")
     p.add_argument("--bg-corner-size", type=int, default=100,
-                   help="Pixels per side of each of the 4 corner boxes "
-                        "used to estimate the background noise floor for "
-                        "the centroid threshold. Default: 100. Reduce if "
-                        "the spot is large enough to encroach on the "
-                        "frame corners.")
+                   help="(binmask algorithm only) Pixels per side of "
+                        "each of the 4 corner boxes used to estimate "
+                        "background statistics. Default: 100.")
     p.add_argument("--bg-sigma-threshold", type=float, default=5.0,
-                   help="The centroid binary mask is built by thresholding "
-                        "at bg_mean + N*bg_std. Default: 5.0. Smaller N "
-                        "includes more of the dim halo (and more noise); "
-                        "larger N keeps only clearly-above-background "
-                        "pixels.")
+                   help="(binmask algorithm only) Threshold is "
+                        "bg_median + N*sigma_from_MAD. Default: 5.0.")
     p.add_argument("--camera-pixel-um", type=float, default=3.45,
                    help="Camera SENSOR pixel pitch (um), pre-binning. "
                         "Procedure multiplies by cam1:BinX_RBV at runtime "
@@ -1351,6 +1399,8 @@ def main(argv: list[str] | None = None) -> int:
         divergence_cumulative_threshold=args.divergence_cumulative_threshold,
         sensitivity_cond_warn_threshold=args.sensitivity_cond_warn_threshold,
         max_correction_per_iter_urad=args.max_correction_urad,
+        centroid_algorithm=args.centroid_algorithm,
+        threshold_fraction=args.threshold_fraction,
         bg_corner_size=args.bg_corner_size,
         bg_sigma_threshold=args.bg_sigma_threshold,
         camera_pixel_um=args.camera_pixel_um,
