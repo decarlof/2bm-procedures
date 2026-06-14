@@ -175,6 +175,11 @@ class _Snapshot:
 
     Deliberately omits MCTOptics selections and the FES shutter — the
     operator is responsible for those (v0.0.1).
+
+    ``table_AY`` / ``table_AX`` are snapshotted at entry but only put
+    back when ``restore(restore_table=True)`` is called -- i.e. on
+    OperatorAbort or any exception. On clean convergence the procedure
+    leaves the optimised AY/AX in place (they're the deliberate output).
     """
     cam_prefix: str = ""
     cam_was_acquiring: bool = False
@@ -187,6 +192,8 @@ class _Snapshot:
     cam_exposure_mode: str = "Timed"
     cam_array_callbacks: str = "Disable"
     z_position: float = 0.0
+    table_AY: float = 0.0
+    table_AX: float = 0.0
 
     @classmethod
     def capture(cls, cam_prefix: str) -> "_Snapshot":
@@ -204,10 +211,17 @@ class _Snapshot:
             cam_exposure_mode=s("ExposureMode"),
             cam_array_callbacks=s("ArrayCallbacks"),
             z_position=float(caget(f"{PV_OP_Z_MOTOR}.RBV")),
+            table_AY=float(caget(PV_TABLE_AY)),
+            table_AX=float(caget(PV_TABLE_AX)),
         )
 
-    def restore_plan(self) -> list[dict]:
-        """Plan-block representation of what restore() will do."""
+    def restore_plan(self, restore_table: bool = True) -> list[dict]:
+        """Plan-block representation of what ``restore()`` will do.
+
+        If ``restore_table=False`` the table AY/AX rows are omitted
+        (clean-convergence path -- the new values are the procedure's
+        deliberate output and stay in place).
+        """
         cp = self.cam_prefix
         plan: list[dict] = [
             {"pv": f"{cp}cam1:Acquire", "current": "?", "target": 0,
@@ -231,12 +245,19 @@ class _Snapshot:
             {"pv": PV_OP_Z_MOTOR, "current": "?",
              "target": self.z_position, "units": "mm"},
         ]
+        if restore_table:
+            plan.extend([
+                {"pv": PV_TABLE_AY, "current": "?",
+                 "target": self.table_AY, "units": "deg"},
+                {"pv": PV_TABLE_AX, "current": "?",
+                 "target": self.table_AX, "units": "deg"},
+            ])
         if self.cam_was_acquiring:
             plan.append({"pv": f"{cp}cam1:Acquire", "current": 0,
                          "target": 1, "units": "(resume)"})
         return plan
 
-    def restore(self) -> None:
+    def restore(self, restore_table: bool = True) -> None:
         cp = self.cam_prefix
         actions = [
             ("stop in-progress acquire",
@@ -268,6 +289,15 @@ class _Snapshot:
             ("Z stage to baseline",
              lambda: move_motor(PV_OP_Z_MOTOR, self.z_position, timeout=180)),
         ]
+        if restore_table:
+            actions.extend([
+                ("table.AY to baseline",
+                 lambda: move_table_axis(PV_TABLE_AY, self.table_AY,
+                                          TABLE_JACK_PREFIXES, timeout=60)),
+                ("table.AX to baseline",
+                 lambda: move_table_axis(PV_TABLE_AX, self.table_AX,
+                                          TABLE_JACK_PREFIXES, timeout=60)),
+            ])
         if self.cam_was_acquiring:
             actions.append(("resume continuous acquire",
                             lambda: caput(f"{cp}cam1:Acquire", 1)))
@@ -623,21 +653,30 @@ class DetectorZRailAlignment:
             return False
         finally:
             if self._snapshot is not None:
-                log.info("restoring pre-procedure state")
+                # Table AY/AX get restored on every exit path EXCEPT a
+                # clean convergence -- if the procedure ran to a converged
+                # alignment, those new values are the deliberate output
+                # and should stay in place. On abort, exception, or
+                # max-iterations-exceeded, put the table back to baseline.
+                restore_table = not converged
+                log.info("restoring pre-procedure state "
+                         "(table AY/AX restored: %s)",
+                         "yes" if restore_table else
+                         "no -- procedure converged, keeping new alignment")
                 # Always announce + run restore -- even in dry-run, the
                 # acquire_image() calls mutate camera state (TriggerMode,
                 # ImageMode, NumImages) and we want those put back.
-                # The Z restore is a no-op when no Z move happened (move
-                # to current position).
+                # The Z restore is a no-op when no Z move happened.
                 confirm_motion(
-                    self._snapshot.restore_plan(),
-                    step_label="restore: returning camera + Z to "
-                               "pre-procedure state",
+                    self._snapshot.restore_plan(restore_table=restore_table),
+                    step_label="restore: returning camera + Z%s to "
+                               "pre-procedure state" %
+                               (" + table" if restore_table else ""),
                     dry_run=False,            # restore is not gated by dry-run
                     auto_yes=c.auto_yes,
                     announce_only=(not c.confirm_restore),
                 )
-                self._snapshot.restore()
+                self._snapshot.restore(restore_table=restore_table)
             if cora:
                 outcome = "complete" if (self.history
                                          and self.history[-1].converged) \
