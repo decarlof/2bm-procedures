@@ -68,12 +68,16 @@ from ._shared.log import setup_console_logger
 # motors drive.
 SLIT_STATIONS = {
     "A": {
-        # Front-end L3 Slits at z = 25225 mm, per item_020.rst.
+        # A-station L3 Slits, per item_020.rst.
+        #   m13 = H+ (X+, outboard), m14 = H- (X-, inboard)
+        #   m15 = V+ (Y+, up),       m16 = V- (Y-, down)
         "prefix": "2bma:Slit1",
-        "blade_prefixes": ("2bma:m1", "2bma:m2", "2bma:m3", "2bma:m4"),
+        "blade_prefixes": ("2bma:m13", "2bma:m14", "2bma:m15", "2bma:m16"),
     },
     "B": {
-        # B-station L3-style slits at z = 50500 mm.
+        # B-station L3-style slits, per item_020.rst.
+        #   m9  = V+ (up),  m10 = V- (down)
+        #   m11, m12 = H pair
         "prefix": "2bma:Slit2",
         "blade_prefixes": ("2bma:m9", "2bma:m10", "2bma:m11", "2bma:m12"),
     },

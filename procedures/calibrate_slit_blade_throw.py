@@ -68,16 +68,18 @@ from ._shared.log import setup_console_logger
 SLIT_STATIONS = {
     "A": {
         "prefix": "2bma:Slit1",
-        # NOTE: A-station blade motor-numbers not explicitly confirmed
-        # in item_020. Verify the per-motor .DESC at runtime if a
-        # particular slope looks wrong.
-        "blade_prefixes": ("2bma:m1", "2bma:m2", "2bma:m3", "2bma:m4"),
+        # Per item_020 (A-station L3 Slits):
+        #   m13 = H+ (X+, outboard)
+        #   m14 = H- (X-, inboard)
+        #   m15 = V+ (Y+, up)
+        #   m16 = V- (Y-, down)
+        "blade_prefixes": ("2bma:m13", "2bma:m14", "2bma:m15", "2bma:m16"),
     },
     "B": {
         "prefix": "2bma:Slit2",
-        # Per item_020 (B-station Slits block):
-        #   m9  = V+ (top)
-        #   m10 = V- (bottom)
+        # Per item_020 (B-station L3-style Slits):
+        #   m9  = V+ (Y+, up)
+        #   m10 = V- (Y-, down)
         #   m11 = H pair
         #   m12 = H pair
         "blade_prefixes": ("2bma:m9", "2bma:m10", "2bma:m11", "2bma:m12"),
