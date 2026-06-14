@@ -294,7 +294,7 @@ class Config:
     z_near: float = 200.0
     z_far: float = 500.0
     z_calibration_step_urad: float = 50.0
-    exposure_time: float = 0.05
+    exposure_time: float = 0.2
     # None -> auto-compute at runtime from lens/binning/dz via
     # expected_noise_floor_urad() x convergence_safety_margin.
     convergence_threshold_urad: float | None = None
@@ -1236,8 +1236,10 @@ def _build_argparser() -> argparse.ArgumentParser:
                    help="Test step applied to table AY/AX for sensitivity "
                         "matrix discovery. Default: 50 urad. If calibration "
                         "fails with a near-singular determinant, try 100.")
-    p.add_argument("--exposure-time", type=float, default=0.05,
-                   help="Camera exposure (s). Default: 0.05.")
+    p.add_argument("--exposure-time", type=float, default=0.2,
+                   help="Camera exposure (s). Default: 0.2 (gives a clean "
+                        "bright spot on 1.1x lens at typical 2-BM-B flux; "
+                        "increase if the centroid signal is weak).")
     p.add_argument("--convergence-urad", type=float, default=None,
                    help="Stop iterating when |tilt_X|, |tilt_Y| are below "
                         "this (urad). DEFAULT: auto-computed from the "
