@@ -320,6 +320,11 @@ class Config:
     threshold_fraction: float = 0.5            # used by "com"
     bg_corner_size: int = 100                  # used by "binmask"
     bg_sigma_threshold: float = 5.0            # used by "binmask"
+    # Number of frames acquired and averaged per centroid measurement.
+    # Shot noise drops by sqrt(N), so N=4 halves the noise contribution
+    # at 4x the acquisition cost per measurement. Default 1 (single
+    # frame, no averaging).
+    frames_per_measurement: int = 1
     max_iterations: int = 5
     camera_pixel_um: float = 3.45
     # Damping factor on the computed correction (0 < damping <= 1). 0.5
@@ -792,8 +797,25 @@ class DetectorZRailAlignment:
         the operator can confirm visually that the algorithm has
         latched onto the bright spot they see on MEDM.
         """
-        frame = acquire_image(self._cam_prefix,
-                              exposure_time=self.config.exposure_time)
+        n = max(1, int(self.config.frames_per_measurement))
+        if n == 1:
+            frame = acquire_image(self._cam_prefix,
+                                  exposure_time=self.config.exposure_time)
+        else:
+            # Average N frames to drop shot-noise by sqrt(N). Acquire
+            # one at a time -- the camera state is left re-armed for
+            # the next single-shot at the end of each acquire_image()
+            # call, so this is just a serial loop, not anything fancy.
+            stack = np.empty((n,) + (0, 0), dtype=np.float32)
+            for i in range(n):
+                f = acquire_image(self._cam_prefix,
+                                  exposure_time=self.config.exposure_time)
+                if i == 0:
+                    stack = np.empty((n,) + f.shape, dtype=np.float32)
+                stack[i] = f
+            frame = np.mean(stack, axis=0)
+            log.debug("averaged %d frames; mean noise floor down ~%.2fx",
+                      n, n ** 0.5)
         algo = self.config.centroid_algorithm
         diag: dict | None = None
 
@@ -829,19 +851,20 @@ class DetectorZRailAlignment:
             camera_pixel_um=self._pixel_um,   # sensor pitch * binning
             magnification=self._magnification,
         )
+        avg_tag = f"avg{n}" if n > 1 else "1f"
         if diag is not None:
-            log.info("centroid[%s]: pix=(%.1f, %.1f) in %dx%d frame; "
+            log.info("centroid[%s,%s]: pix=(%.1f, %.1f) in %dx%d frame; "
                      "offset-from-centre=(%+.1f, %+.1f) pix; "
                      "object-um=(%+.2f, %+.2f); beam=%d pix (%.2f%%), "
                      "threshold=%.0f (bg_median=%.0f, bg_sigma=%.1f)",
-                     algo, px, py, w, h, dx_pix, dy_pix, x_um, y_um,
+                     algo, avg_tag, px, py, w, h, dx_pix, dy_pix, x_um, y_um,
                      diag["n_beam_pix"], 100 * diag["frame_pix_fraction"],
                      diag["threshold"], diag["bg_median"], diag["bg_sigma"])
         else:
-            log.info("centroid[%s]: pix=(%.1f, %.1f) in %dx%d frame; "
+            log.info("centroid[%s,%s]: pix=(%.1f, %.1f) in %dx%d frame; "
                      "offset-from-centre=(%+.1f, %+.1f) pix; "
                      "object-um=(%+.2f, %+.2f)",
-                     algo, px, py, w, h, dx_pix, dy_pix, x_um, y_um)
+                     algo, avg_tag, px, py, w, h, dx_pix, dy_pix, x_um, y_um)
         return (x_um, y_um)
 
     def _centroid_failure_message(self, reason: str) -> str:
@@ -1356,6 +1379,12 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--bg-sigma-threshold", type=float, default=5.0,
                    help="(binmask algorithm only) Threshold is "
                         "bg_median + N*sigma_from_MAD. Default: 5.0.")
+    p.add_argument("--frames-per-measurement", type=int, default=1,
+                   help="Acquire and average N frames per centroid "
+                        "measurement. Centroid noise drops as sqrt(N) "
+                        "at N x acquisition cost per measurement. "
+                        "Default: 1 (no averaging). Try 4 for ~2x SNR "
+                        "boost on the sensitivity matrix.")
     p.add_argument("--camera-pixel-um", type=float, default=3.45,
                    help="Camera SENSOR pixel pitch (um), pre-binning. "
                         "Procedure multiplies by cam1:BinX_RBV at runtime "
@@ -1403,6 +1432,7 @@ def main(argv: list[str] | None = None) -> int:
         threshold_fraction=args.threshold_fraction,
         bg_corner_size=args.bg_corner_size,
         bg_sigma_threshold=args.bg_sigma_threshold,
+        frames_per_measurement=args.frames_per_measurement,
         camera_pixel_um=args.camera_pixel_um,
         gate_z=args.gate_z,
         dry_run=args.dry_run,
