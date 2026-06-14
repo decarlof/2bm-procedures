@@ -120,6 +120,18 @@ class Config:
     target_h_size_mm: float = 0.0
     target_v_size_mm: float = 0.0
 
+    # Phase 3: rezero (redefine current pose as origin). Default ON.
+    # Sequence per axis: <prefix><axis>set = "Set" -> caput
+    # <prefix><axis>center = 0, <prefix><axis>size = 0 -> <prefix><axis>set
+    # = "Use". After this both H and V virtual motors read 0 at the
+    # current physical pose. Irreversible: once rezero runs the
+    # snapshot-restore for slits is disabled (the OLD center/size
+    # values are in the pre-rezero coordinate system; writing them
+    # back through the new origin would physically move the slits
+    # to nonsensical positions). Gated; operator can answer N to
+    # skip rezeroing while keeping the centred + closed state.
+    rezero: bool = True
+
     # Image acquisition
     exposure_time: float = 0.2
     centroid_algorithm: str = "com"
@@ -346,6 +358,11 @@ class CentreAndCloseSlits:
         self._frame_center_x: float = 0.0
         self._frame_center_y: float = 0.0
         self._centring_committed: bool = False
+        # Set as soon as ANY rezero write is issued. Disables slit
+        # restore in the finally block -- the snapshot's center/size
+        # are in the pre-rezero coordinate system and writing them
+        # back through the new origin would move the slits.
+        self._rezero_started: bool = False
 
     # ---- detection -------------------------------------------------------
 
@@ -686,6 +703,76 @@ class CentreAndCloseSlits:
                  float(caget(f"{self.slit_prefix}Hsize")),
                  float(caget(f"{self.slit_prefix}Vsize")))
 
+    # ---- phase 3: rezero --------------------------------------------------
+
+    def _gated_rezero_axis(self, axis: str) -> bool:
+        """Rezero one slit axis ("H" or "V").
+
+        EPICS pattern for redefining current position as origin:
+
+          1. <prefix><axis>set = "Set"   (mbbo: 0=Use, 1=Set)
+          2. caput <prefix><axis>center = 0
+          3. caput <prefix><axis>size   = 0
+          4. <prefix><axis>set = "Use"
+
+        In "Set" mode the slit calc records interpret writes to the
+        center / size virtual motors as position-redefinition (the
+        new value becomes the readback at the current physical
+        pose) rather than motion commands. Switching back to "Use"
+        re-enables motion semantics.
+
+        Returns True if the operator confirmed and the rezero was
+        issued; False if the operator declined the gate (dry-run
+        is honoured -- prints plan, skips writes).
+        """
+        c = self.config
+        set_pv = f"{self.slit_prefix}{axis}set"
+        center_pv = f"{self.slit_prefix}{axis}center"
+        size_pv = f"{self.slit_prefix}{axis}size"
+        cur_setuse = caget(set_pv, as_string=True)
+        cur_center = float(caget(center_pv))
+        cur_size = float(caget(size_pv))
+        plan = [
+            {"pv": set_pv, "current": cur_setuse, "target": "Set",
+             "units": "(mode -> redefine)"},
+            {"pv": center_pv, "current": cur_center, "target": 0.0,
+             "units": "mm (redefine origin)"},
+            {"pv": size_pv, "current": cur_size, "target": 0.0,
+             "units": "mm (redefine origin)"},
+            {"pv": set_pv, "current": "Set", "target": "Use",
+             "units": "(mode -> motion)"},
+        ]
+        proceed = self._gate(
+            plan,
+            step_label=f"REZERO {axis} axis (IRREVERSIBLE: "
+                       f"redefines current pose as origin; after this "
+                       f"both {axis}center and {axis}size will read 0)",
+        )
+        if not proceed:
+            return False
+        # Once we start writing, mark _rezero_started so the finally
+        # block knows not to restore the slits via the snapshot's
+        # pre-rezero center/size values.
+        self._rezero_started = True
+        if not c.dry_run:
+            caput(set_pv, "Set", wait=True, timeout=5.0)
+            caput(center_pv, 0.0, wait=True, timeout=5.0)
+            caput(size_pv, 0.0, wait=True, timeout=5.0)
+            caput(set_pv, "Use", wait=True, timeout=5.0)
+            log.info("  %s axis rezeroed: %scenter=%s, %ssize=%s now "
+                     "read 0 at current physical pose",
+                     axis, axis, caget(center_pv), axis, caget(size_pv))
+        return True
+
+    def rezero_slits(self) -> None:
+        """Phase 3: rezero both H and V axes. Each gated separately."""
+        log.info("rezero phase: redefining current slit pose as origin "
+                 "(IRREVERSIBLE -- pre-rezero snapshot becomes meaningless "
+                 "in the new coordinate system; slit restore is disabled "
+                 "once any rezero write happens)")
+        self._gated_rezero_axis("H")
+        self._gated_rezero_axis("V")
+
     # ---- shared helpers ---------------------------------------------------
 
     def _centroid_failure_message(self, reason: str) -> str:
@@ -743,6 +830,11 @@ class CentreAndCloseSlits:
                 closed = True
                 if cora:
                     cora.append_step("close_slits", {"closed": True})
+                if c.rezero:
+                    self.rezero_slits()
+                    if cora:
+                        cora.append_step(
+                            "rezero", {"rezero_started": self._rezero_started})
             else:
                 log.warning("skipping close phase because centring did not "
                             "converge to threshold (best state was committed)")
@@ -754,16 +846,27 @@ class CentreAndCloseSlits:
             return False
         finally:
             if self._snapshot is not None:
-                # On clean completion (centred + closed): leave slits as-is
-                # (the procedure's deliberate output). Otherwise restore.
-                # If centring committed but we aborted in phase 2, we'd
-                # ideally keep the new centre and restore only the size;
-                # for v0.0.1 the simpler "restore everything on abort"
-                # is the rule. Operator can re-run.
-                restore_slits = not (converged and closed)
+                # Restore slits unless either:
+                #   - Procedure completed centring + closing cleanly (the
+                #     new slit pose is the deliberate output), OR
+                #   - Any rezero write was issued (the snapshot's
+                #     pre-rezero center/size values are in the old
+                #     coordinate system; writing them back through the
+                #     new origin would physically move the slits to
+                #     nonsensical positions).
+                restore_slits = not ((converged and closed)
+                                     or self._rezero_started)
+                if self._rezero_started:
+                    reason = ("no -- rezero issued; pre-rezero snapshot "
+                              "values are in the old coordinate system")
+                elif (converged and closed):
+                    reason = ("no -- procedure completed cleanly, "
+                              "keeping new state")
+                else:
+                    reason = ("yes -- procedure did not complete; "
+                              "returning slits to baseline")
                 log.info("restoring pre-procedure state (slits restored: %s)",
-                         "yes" if restore_slits else
-                         "no -- procedure completed cleanly, keeping new state")
+                         reason)
                 confirm_motion(
                     self._snapshot.restore_plan(restore_slits=restore_slits),
                     step_label="restore: returning %scamera to pre-procedure "
@@ -816,6 +919,16 @@ def _build_argparser() -> argparse.ArgumentParser:
                    help="Final H aperture. Default: 0 (fully closed).")
     p.add_argument("--target-v-size-mm", type=float, default=0.0,
                    help="Final V aperture. Default: 0 (fully closed).")
+    # Phase 3
+    p.add_argument("--no-rezero", action="store_true",
+                   help="Skip the rezero phase (default: rezero is "
+                        "enabled). When enabled, after closing the "
+                        "procedure issues set/use=Set + write 0 to "
+                        "Hcenter/Vcenter/Hsize/Vsize + set/use=Use, "
+                        "redefining the current physical pose as the "
+                        "new origin. Each H and V rezero is gated "
+                        "separately and IRREVERSIBLE -- once issued, "
+                        "the snapshot restore for slits is disabled.")
     # Image acquisition
     p.add_argument("--exposure-time", type=float, default=0.2,
                    help="Camera exposure (s). Default: 0.2.")
@@ -862,6 +975,7 @@ def main(argv: list[str] | None = None) -> int:
         closing_step_mm=args.closing_step_mm,
         target_h_size_mm=args.target_h_size_mm,
         target_v_size_mm=args.target_v_size_mm,
+        rezero=(not args.no_rezero),
         exposure_time=args.exposure_time,
         centroid_algorithm=args.centroid_algorithm,
         threshold_fraction=args.threshold_fraction,
