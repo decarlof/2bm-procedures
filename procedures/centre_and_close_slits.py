@@ -109,11 +109,24 @@ class Config:
 
     # Phase 1: centring
     centring_step_mm: float = 0.5      # perturbation for M calibration
-    centring_threshold_pix: float = 5.0  # centroid within N pixels of centre
+    # Centring threshold default (15 pix) is at the COM noise floor
+    # for typical 2-BM-B DMM images: a single-frame intensity-weighted
+    # COM jitters by ~10-20 pix because multilayer stripes inside the
+    # spot bias the weighting. Tightening below ~15 pix is impossible
+    # without frame averaging or a different centroid algorithm.
+    centring_threshold_pix: float = 15.0
     centring_max_iterations: int = 5
     centring_damping: float = 0.5
     centring_max_correction_mm: float = 1.0  # clip per iteration per axis
     centring_min_sensitivity: float = 1.0    # min |det(M)| (pix/mm)^2
+    # Divergence-grow threshold for the iter-to-iter error magnitude.
+    # 2.0 is looser than detector_z_rail_alignment's 1.5 because the
+    # COM centroid in this slit-centring case sits in a noisy regime
+    # (the rail-alignment runs at the centre of the field where the
+    # spot is clean; here we may be at the edge of the multilayer
+    # pattern and noise can briefly bump the error magnitude by 1.5x
+    # without indicating a real failure).
+    centring_divergence_grow_threshold: float = 2.0
 
     # Phase 2: closing
     closing_step_mm: float = 0.1       # incremental size reduction
@@ -626,11 +639,23 @@ class CentreAndCloseSlits:
                 log.info("  iter %d: CONVERGED", i)
                 return True
 
-            # Simple divergence guard
-            if prev_err is not None and err_mag > prev_err * 1.5 and not c.dry_run:
+            # Simple divergence guard. Threshold is configurable
+            # (Config.centring_divergence_grow_threshold) because the
+            # COM centroid noise on slit-edge images can briefly bump
+            # |err| by ~1.5x between iterations without indicating a
+            # real failure -- this is more permissive than the
+            # detector_z_rail_alignment guard for that reason.
+            grow_threshold = c.centring_divergence_grow_threshold
+            if (prev_err is not None
+                    and err_mag > prev_err * grow_threshold
+                    and not c.dry_run):
                 raise RuntimeError(
                     f"centring diverging at iter {i}: |err|={err_mag:.1f} > "
-                    f"1.5x prev {prev_err:.1f}; M may be wrong."
+                    f"{grow_threshold:.1f}x prev {prev_err:.1f}; "
+                    "either M is inaccurate (try --centring-step-mm 1.0 "
+                    "or larger), or the centroid noise floor is above "
+                    "--centring-threshold-pix (try a larger threshold "
+                    "and/or --frames-per-measurement 4 to reduce noise)."
                 )
             prev_err = err_mag
 
@@ -942,10 +967,19 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--centring-step-mm", type=float, default=0.5,
                    help="Perturbation applied to Hcenter / Vcenter for "
                         "sensitivity calibration. Default: 0.5 mm.")
-    p.add_argument("--centring-threshold-pix", type=float, default=5.0,
+    p.add_argument("--centring-threshold-pix", type=float, default=15.0,
                    help="Centroid must be within N pixels of frame centre "
                         "in both axes to declare centring converged. "
-                        "Default: 5 pix.")
+                        "Default: 15 pix (at the COM noise floor on "
+                        "this beamline's multilayer-stripe images; "
+                        "tightening below ~15 pix requires frame "
+                        "averaging via --frames-per-measurement).")
+    p.add_argument("--centring-divergence-grow-threshold", type=float,
+                   default=2.0,
+                   help="Abort centring if |err| grows by more than this "
+                        "factor between iterations. Default: 2.0 (looser "
+                        "than detector_z_rail_alignment because COM noise "
+                        "can briefly bump |err| at small corrections).")
     p.add_argument("--centring-max-iterations", type=int, default=5,
                    help="Default: 5.")
     p.add_argument("--centring-damping", type=float, default=0.5,
@@ -1023,6 +1057,7 @@ def main(argv: list[str] | None = None) -> int:
         centring_max_iterations=args.centring_max_iterations,
         centring_damping=args.centring_damping,
         centring_max_correction_mm=args.centring_max_correction_mm,
+        centring_divergence_grow_threshold=args.centring_divergence_grow_threshold,
         closing_step_mm=args.closing_step_mm,
         target_h_size_mm=args.target_h_size_mm,
         target_v_size_mm=args.target_v_size_mm,
