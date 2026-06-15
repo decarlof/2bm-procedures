@@ -74,6 +74,10 @@ SLIT_STATIONS = {
         #   m15 = V+ (Y+, up)
         #   m16 = V- (Y-, down)
         "blade_prefixes": ("2bma:m13", "2bma:m14", "2bma:m15", "2bma:m16"),
+        # z position from source (item_020 layout map).
+        "z_mm": 25225,
+        # No upstream slit between source and A.
+        "upstream_station": None,
     },
     "B": {
         "prefix": "2bma:Slit2",
@@ -83,6 +87,11 @@ SLIT_STATIONS = {
         #   m11 = H pair
         #   m12 = H pair
         "blade_prefixes": ("2bma:m9", "2bma:m10", "2bma:m11", "2bma:m12"),
+        "z_mm": 50500,
+        # A's aperture, projected forward to B's plane, must contain
+        # B's whole blade-throw range -- else A limits the spot first
+        # and B's slope measurement is biased low.
+        "upstream_station": "A",
     },
 }
 
@@ -579,6 +588,65 @@ class CalibrateSlitBladeThrow:
 
     # ---- orchestrator -----------------------------------------------------
 
+    def _check_upstream_aperture(self) -> None:
+        """Warn if an upstream slit's aperture, projected forward to this
+        station's plane, is too small to contain the spot through the
+        full blade-throw range. The geometric projection assumes a
+        point source at z=0; penumbra from finite source size only
+        widens the beam further, so this check is conservative.
+
+        Purely additive: emits ``log.warning`` only -- no caputs, no
+        gates, no procedure-flow change. Operator can ignore and the
+        run proceeds exactly as without the check; only the measured
+        slope on a clipped blade would be biased low.
+        """
+        c = self.config
+        station = SLIT_STATIONS[c.slit_station]
+        upstream_key = station.get("upstream_station")
+        if upstream_key is None:
+            return
+        upstream = SLIT_STATIONS[upstream_key]
+        z_target = float(station["z_mm"])
+        z_upstream = float(upstream["z_mm"])
+        mag = z_target / z_upstream  # >1: downstream projection enlarges
+        target_prefix = station["prefix"]
+        upstream_prefix = upstream["prefix"]
+        try:
+            target_h = float(caget(f"{target_prefix}Hsize"))
+            target_v = float(caget(f"{target_prefix}Vsize"))
+            upstream_h = float(caget(f"{upstream_prefix}Hsize"))
+            upstream_v = float(caget(f"{upstream_prefix}Vsize"))
+        except Exception as exc:
+            log.debug("upstream-aperture check skipped (caget failed: %s)", exc)
+            return
+        # Max half-extent any single blade reaches during the procedure:
+        # current half-aperture + blade_throw_mm (one blade moves while
+        # the other stays put, so the extreme is on the moving side).
+        target_extreme_h = target_h / 2 + c.blade_throw_mm
+        target_extreme_v = target_v / 2 + c.blade_throw_mm
+        # Upstream half-aperture must cover that extreme when projected
+        # back: required_upstream_half = target_extreme / mag.
+        required_upstream_h = 2 * target_extreme_h / mag
+        required_upstream_v = 2 * target_extreme_v / mag
+        # 1.5x margin in the recommended fix value.
+        for axis, current, required in [
+                ("H", upstream_h, required_upstream_h),
+                ("V", upstream_v, required_upstream_v)]:
+            if current < required:
+                log.warning(
+                    "upstream %s station %ssize = %.3f mm is SMALLER than "
+                    "the safe minimum %.3f mm (target station %s's "
+                    "%s-blade reaches half-extent %.3f mm at +throw; "
+                    "projection mag from z=%.0f to z=%.0f is %.2fx). "
+                    "Upstream slit will clip the spot before %s blades do, "
+                    "biasing the slope measurement LOW. To fix:  "
+                    "caput %s%ssize %.2f",
+                    upstream_key, upstream_prefix, current, required,
+                    c.slit_station, axis,
+                    target_extreme_h if axis == "H" else target_extreme_v,
+                    z_upstream, z_target, mag, c.slit_station,
+                    upstream_prefix, axis, max(required * 1.5, 5.0))
+
     def run(self) -> bool:
         c = self.config
         self.detect_camera_and_lens()
@@ -586,6 +654,7 @@ class CalibrateSlitBladeThrow:
         log.info("snapshotted blade baselines (mm):")
         for pv, val in self._snapshot.blade_positions.items():
             log.info("  %s = %+.4f", pv, val)
+        self._check_upstream_aperture()
 
         cora = (CoraProcedureLog(
             slug="calibrate_slit_blade_throw",
