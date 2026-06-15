@@ -7,6 +7,223 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## v0.0.2 — 2026-06-14 — `calibrate_slit_blade_throw` validated; A V miscal diagnosed and fixed
+
+### Summary
+
+Second procedure to reach validated end-to-end status:
+`procedures.calibrate_slit_blade_throw`. Drives each L3-style slit
+blade motor by ±`blade_throw_mm` from baseline, measures how far
+the spot's corresponding edge moves on the detector, and reports
+per-blade pixels-per-mm slopes with same-axis spread and V/H ratio
+flags.
+
+First real-data application immediately surfaced a quantitative
+diagnosis of the A-station V-blade calibration error that had been
+an operator workaround for months ("set Vsize = 0.6 mm to get a
+square image when Hsize = 1.0 mm"):
+
+- **A station before fix:** H mean **334 px/mm**, V mean **497**,
+  **V/H = 1.487** (WARN) — V blades over-scaled by 49%.
+- **A station after fix** (live IOC `caput .MRES` on m15 and m16
+  from `4e-4` to `5.95e-4` via SET/Use position-redefinition;
+  persisted by autosave): H mean 334, V mean 336,
+  **V/H = 1.008** (PASS).
+- **B station** (no fix needed): H mean 168, V mean 171,
+  **V/H = 1.019** (PASS). Same-axis spreads: H 0.5%, V 1.2%.
+- All slope ratios consistent with geometric expectations: A
+  slits at z=25225 mm, B slits at z=50500 mm, detector at
+  z≈50500. A's px/mm is ~2× B's, matching the 2× geometric
+  magnification of A's projection at the detector plane.
+
+In addition to the calibration data, the field test surfaced two
+real beamline observations worth recording (neither actionable in
+this release):
+
+- A's V blade pair has a small mechanical **tilt** — the
+  blade-throw procedure measures ~334 px/mm per V blade (matching
+  H), but `centre_and_close_slits`'s centring-sensitivity matrix
+  measures only 134 px/mm for V vs 330 for H. The discrepancy is
+  consistent with a tilted blade-pair shifting the slit
+  projection less than 1:1 as the centre moves. Not a calibration
+  problem; just a geometric fact about A's V kinematic.
+- **DMM image flip:** at A, blade-to-edge mappings are mirrored
+  from item_020's labels (H+ outboard moves the LEFT edge of the
+  spot; V+ up moves the BOTTOM edge). At B, no flip. The DMM
+  Bragg reflection between A and B inverts one axis of A's image
+  relative to B's image at the detector. Useful to know for any
+  future blade-direction debugging.
+
+### What this procedure does
+
+`calibrate_slit_blade_throw` characterises the per-blade pixel-
+per-mm slope of each of the four blade motors in a chosen L3-style
+slit station (A or B). For each blade: snapshot baseline, drive
+to baseline + `blade_throw_mm` (gated), measure spot edge bbox
+via 1D row/column profile half-max crossings; drive to baseline −
+`blade_throw_mm` (gated), measure again; restore baseline
+(gated). Compute the slope as (Δprimary-edge_pix) / (−2 ×
+`blade_throw_mm`). Same-axis-blade agreement and V/H mean ratio
+flag mis-calibrated motor records.
+
+Output is **pure diagnostic** — every blade is restored to its
+baseline at the end of the run (no deliberate output left in
+place). The operator interprets the report and changes IOC
+`.MRES` (or .ERES, gear ratio) manually if a miscal is found.
+
+The operator-facing spec is at
+[`2bm-docs/procedures/item_012.rst`](https://docs2bm.readthedocs.io/en/latest/source/procedures/item_012.html);
+that page is the source of truth for parameters, predicates,
+preconditions, and failure modes. This CHANGELOG documents the
+implementation history.
+
+### Architecture
+
+- **One blade at a time**. The four blade motor records (e.g.
+  `2bma:m13.VAL` for A's H+ blade) are driven directly, NOT via
+  the virtual `Slit*Hsize` / `Vcenter` ao records. The slope
+  reported is the raw motor-mm calibration, independent of the
+  slit calc.
+- **Per-motion confirmation gate** on every blade move (3 gates
+  per blade × 4 blades = 12 gates per run).
+- **Snapshot + restore** for all four blade baselines plus full
+  camera state. `try/finally` always restores — this is a
+  measurement, not a state-change procedure.
+- **Profile-based edge detection.** 1D row/column-averaged
+  profiles of the ROI, threshold at `p10 + 0.5 × (p90 − p10)`
+  with subpixel linear interpolation between bracketing samples.
+  Halo is < 50% of plateau so half-max naturally clips it;
+  profile averaging suppresses multilayer-stripe noise; subpixel
+  interpolation gives ~0.1 px slope precision on a single frame.
+- **Auto-detection** of camera and lens via MCTOptics
+  `CameraSelect` / `LensSelect`, same pattern as
+  `detector_z_rail_alignment`.
+- **Upstream-aperture guardrail** (added in this version): on
+  startup, projects any upstream slit's aperture forward to the
+  target station's plane and `log.warning`s if it's too small to
+  contain the worst-case blade extent during the procedure. Pure
+  log; no caputs or flow change. For B, the upstream is A. For A,
+  no upstream slit and the check is a no-op.
+- **ANSI-coloured console logging**, same `_shared/log.py` as
+  `detector_z_rail_alignment`.
+
+### cora-process mapping
+
+| 2bm-procedures (v0.0.2)              | cora aggregate |
+|--------------------------------------|----------------|
+| `calibrate_slit_blade_throw.py`      | `Procedure` body |
+| `SLIT_STATIONS[A|B]` dict            | `Procedure.target_assets` (per-station `Slit` Asset) |
+| `BladeCalibrationResult`             | one `procedure_step` per blade with `slope_pix_per_mm` payload |
+| Per-blade result `slope_pix_per_mm`  | new field `calibration_slope_pix_per_mm` on each blade-motor Asset (4 per station) |
+| `_Snapshot.restore()`                | `Procedure.rollback` Method (always-restore variant) |
+| `_shared/cora_log.py`                | REST client to the audit-spine endpoint |
+| Run outcome                          | `Procedure.outcome` (`complete` / `truncate` / `abort`) |
+
+### Bugs fixed during v0.0.2 development
+
+- **A-station blade PV list was wrong.** `SLIT_STATIONS["A"]`
+  carried `("2bma:m1", "m2", "m3", "m4")` as a stale TODO copied
+  forward from an earlier draft — those PVs are M1 mirror motors,
+  not slit blades. Caught at the first gate prompt on the first
+  real-data run (no caput happened). Per `item_020`, correct
+  A-station blades are `m13` (H+ outboard), `m14` (H− inboard),
+  `m15` (V+ up), `m16` (V− down). Fixed in `c08b6ab`; same fix
+  applied to `centre_and_close_slits.py`, which had the same
+  wrong list and had been silently polling the mirror-motor
+  `.DMOV` for motion-done detection during A-station centring
+  runs.
+- **Bbox detector collapsed to ROI on multilayer-stripe images.**
+  Initial implementation used "mask `>` (bg_median + 5 × MAD_σ)
+  then take 2D bounding box". The slit-defined bright square at
+  the detector has a faint scatter halo extending well outside the
+  geometric aperture; on the noisy multilayer-stripe background,
+  the halo exceeded the MAD-derived threshold everywhere in the
+  400-px-half-side ROI. Every blade reported the bbox edges as
+  exactly the ROI edges; every reported displacement was zero.
+  Replaced with 1D row/column-averaged profiles + half-max
+  crossings with subpixel linear interpolation between bracketing
+  samples. Halo is < 50% of plateau so half-max clips it cleanly.
+  Synthetic-data unit test confirms 99.5 / 399.5 crossings on a
+  100-400 plateau. Fixed in `91ab863`.
+
+### Operator-side findings (not code changes)
+
+- **A V blades miscal root cause:** the IOC substitution file
+  `/net/s2dserv/xorApps/epics/synApps_5_8/ioc/2bma/iocBoot/ioc2bma/motor.substitutions`
+  uses a single template for **every** motor m1..m44+ — all
+  share `MRES=2.5e-4`, `EGU="degrees"`, `VELO=1`. The per-axis
+  mechanical differences (lead-screw pitch, gear ratio) between
+  the A H blade assembly and the A V blade assembly were never
+  compensated. Live autosave had already raised MRES to `4e-4`
+  for these blades, but the per-axis differentiation was still
+  missing. Other motors on the crate are very likely similarly
+  mis-calibrated — this procedure provides the tooling to
+  characterise any of them.
+- **A V tilt** (see Summary). Confirmed by H/V centring-
+  sensitivity asymmetry surviving the MRES fix.
+- **DMM image flip** between A and B (see Summary).
+
+### CLI surface (v0.0.2)
+
+```
+python -m procedures.calibrate_slit_blade_throw [OPTIONS]
+
+Geometry / slit:
+  --slit-station                    "A" or "B"
+  --blade-throw-mm                  ± move per blade from baseline (default 0.5)
+  --edge-roi-half-size-pix          ROI half-side around spot centre (default 400)
+
+Edge detection:
+  --aperture-edge-level             Half-max fraction of (p90-p10) (default 0.5)
+  --aperture-min-dynamic-range      Min profile range for visible spot (default 100)
+  --threshold-fraction              COM threshold (initial centroid) (default 0.5)
+
+Camera:
+  --exposure-time                   Per-frame exposure s (default 0.2)
+  --frames-per-measurement          Average N frames per bbox (default 1)
+  --camera-pixel-um                 Sensor pitch um (default 3.45)
+
+Confirmation / safety:
+  --yes                             Auto-confirm every prompt
+  --confirm-restore                 Also gate the restore path
+  --dry-run                         Plan + skip every motion
+
+Logging / observability:
+  --log-level                       DEBUG | INFO | WARNING | ERROR (default INFO)
+  --no-cora-log                     Skip cora Procedure record
+```
+
+### Open follow-ups (will inform later versions)
+
+- **cora wiring**. Extend the per-station `Slit` Asset with four
+  `calibration_slope_pix_per_mm` fields (one per blade motor)
+  populated from this procedure's report; register the procedure
+  in `cora/docs/deployments/2-bm/procedures.md`.
+- **Characterise the rest of the OMS VME58 crate.** Many other
+  motors share the same MRES template default; almost certainly
+  most have un-compensated per-axis mechanical differences. A
+  follow-up procedure could iterate this calibration over an
+  operator-supplied motor list and produce a summary table.
+- **Optional `--prepare` flag.** Open upstream slits + set target
+  to 1×1 mm before the calibration, then restore on exit. Convenience
+  one-button operation. Current workflow asks the operator to do
+  this manually (one or two caputs).
+- **Per-station `z_mm` should live in `item_020.rst` rather than
+  hardcoded in `SLIT_STATIONS`.** Once `2bm-docs` exposes a
+  machine-readable form of the layout map, source the projection
+  geometry from there.
+
+### Acknowledgements
+
+The bbox-failure debugging was steered by the operator on the
+floor — without their willingness to paste full run logs after
+each algorithm iteration the half-max-profile fix would have
+taken much longer to converge on. The downstream "set Vsize = 0.6
+when Hsize = 1.0" trick that motivated the V calibration analysis
+was the first hint that the IOC was wrong, not the operator.
+
+---
+
 ## v0.0.1 — 2026-06-14 — first end-to-end convergence on 2-BM-B
 
 ### Summary
