@@ -659,7 +659,7 @@ class CalibrateSlitBladeThrow:
         cora = (CoraProcedureLog(
             slug="calibrate_slit_blade_throw",
             target_asset_ids=[
-                f"{c.slit_station}_station_slits",
+                {"A": "ConditioningSlit", "B": "SampleSlit"}[c.slit_station],
             ],
             parameters=vars(c),
         ) if c.enable_cora_log else None)

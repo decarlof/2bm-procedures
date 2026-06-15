@@ -870,7 +870,7 @@ class CentreAndCloseSlits:
         cora = (CoraProcedureLog(
             slug="centre_and_close_slits",
             target_asset_ids=[
-                f"{c.slit_station}_station_slits",  # pending cora
+                {"A": "ConditioningSlit", "B": "SampleSlit"}[c.slit_station],
             ],
             parameters=vars(c),
         ) if c.enable_cora_log else None)

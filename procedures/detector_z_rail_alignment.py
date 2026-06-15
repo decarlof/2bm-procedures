@@ -1225,8 +1225,8 @@ class DetectorZRailAlignment:
         cora = (CoraProcedureLog(
             slug="detector_z_rail_alignment",
             target_asset_ids=[
-                "Optique_Peter_focus_Z",
-                "Detector_optical_table",   # pending cora registration
+                "Focus",
+                "DetectorTable",   # pending cora registration
                 "Scintillator_LuAG",
             ],
             parameters=vars(c),
