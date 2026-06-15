@@ -1225,7 +1225,7 @@ class DetectorZRailAlignment:
         cora = (CoraProcedureLog(
             slug="detector_z_rail_alignment",
             target_asset_ids=[
-                "Focus",
+                "PropagationDistance",   # was "Focus" in cora #111; renamed
                 "DetectorTable",   # pending cora registration
                 "Scintillator_LuAG",
             ],
